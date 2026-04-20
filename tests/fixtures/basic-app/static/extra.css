@@ -1,0 +1,3 @@
+.static-css-marker {
+	--marker: 'served from static/extra.css';
+}

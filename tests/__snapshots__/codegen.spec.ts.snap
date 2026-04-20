@@ -1,0 +1,33 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`generate_entry > happy path: snapshot 1`] = `
+"import { Server } from "./server/index.js";
+import { manifest, prerendered } from "./server/manifest.js";
+import { start } from "./serve.js";
+
+import _client_0 from "./client/favicon.png" with { type: 'file' };
+import _client_1 from "./client/_app/immutable/chunks/abc.js" with { type: 'file' };
+import _prerendered_0 from "./prerendered/about.html" with { type: 'file' };
+import _server_0 from "./server/_app/immutable/assets/data.bin" with { type: 'file' };
+
+const client_assets = {
+	"/favicon.png": _client_0,
+	"/_app/immutable/chunks/abc.js": _client_1
+};
+const prerendered_assets = {
+	"/about": _prerendered_0
+};
+const server_assets = {
+	"data.bin": _server_0
+};
+
+await start({
+	Server,
+	manifest,
+	prerendered,
+	client_assets,
+	prerendered_assets,
+	server_assets
+});
+"
+`;

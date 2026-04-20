@@ -1,9 +1,12 @@
-import { Server as BunServer } from "bun";
-
 declare global {
 	namespace App {
 		export interface Platform {
-			server: BunServer;
+			/**
+			 * The Bun server instance handling the request.
+			 */
+			server: import('bun').Server<unknown>;
 		}
 	}
 }
+
+export {};
