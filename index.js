@@ -1,4 +1,5 @@
 import { generate_entry } from './src/codegen.js';
+import { apply_windows_branding } from './src/windows-brand.js';
 
 const files = `${import.meta.dirname}/files`;
 
@@ -14,9 +15,19 @@ const NATIVE_ADDON_PACKAGES = [
 	'@mapbox/node-pre-gyp'
 ];
 
+/**
+ * A build job's target is a Windows one if it explicitly names a
+ * `bun-windows-*` triple, or — when no target is given — the host running
+ * the build is Windows itself (Bun then compiles for the host).
+ * @param {string | undefined} target
+ */
+function is_windows_target(target) {
+	return target ? target.startsWith('bun-windows') : process.platform === 'win32';
+}
+
 /** @type {import('./index.js').default} */
 export default function plugin(opts = {}) {
-	const { out = 'build', binaryName = 'app', envPrefix = '', compile = true, targets } = opts;
+	const { out = 'build', binaryName = 'app', envPrefix = '', compile = true, targets, windows } = opts;
 
 	return {
 		name: '@sveltejs/adapter-bun',
@@ -117,8 +128,17 @@ export default function plugin(opts = {}) {
 							}
 						];
 
+			if (windows && !build_jobs.some((job) => is_windows_target(job.target))) {
+				builder.log.warn(
+					'@sveltejs/adapter-bun: `windows` option was set but no Windows target is being built; ignoring.'
+				);
+			}
+
 			await Promise.all(
 				build_jobs.map(async ({ target, outfile }) => {
+					const windows_job = is_windows_target(target);
+					const cross_compiling_windows = windows_job && process.platform !== 'win32';
+
 					builder.log.minor(
 						`Compiling single-file executable (${outfile.slice(out.length + 1)}${
 							target ? ` for ${target}` : ''
@@ -128,6 +148,9 @@ export default function plugin(opts = {}) {
 					/** @type {Record<string, unknown>} */
 					const compile_opts = { outfile };
 					if (target) compile_opts.target = target;
+					// Bun silently ignores `compile.windows` when cross-compiling (it depends on
+					// Windows APIs), so only pass it through when actually building on Windows.
+					if (windows && windows_job && !cross_compiling_windows) compile_opts.windows = windows;
 
 					const result = await Bun.build({
 						entrypoints: [`${out}/entry.js`],
@@ -143,6 +166,36 @@ export default function plugin(opts = {}) {
 						}
 						throw new Error(
 							`@sveltejs/adapter-bun: Bun.build --compile failed${target ? ` for ${target}` : ''}`
+						);
+					}
+
+					if (windows && windows_job && cross_compiling_windows) {
+						builder.log.minor(
+							`Applying \`windows\` icon/metadata to ${outfile.slice(out.length + 1)} (post-processed; cross-compiled from ${process.platform})`
+						);
+
+						let icon_bytes = null;
+						if (windows.icon) {
+							const icon_file = Bun.file(windows.icon);
+							if (!(await icon_file.exists())) {
+								throw new Error(
+									`@sveltejs/adapter-bun: \`windows.icon\` file not found: ${windows.icon}`
+								);
+							}
+							icon_bytes = await icon_file.arrayBuffer();
+						}
+
+						const exe_bytes = await Bun.file(outfile).arrayBuffer();
+						const patched = apply_windows_branding(exe_bytes, windows, icon_bytes);
+						await Bun.write(outfile, patched);
+
+						builder.log.warn(
+							`@sveltejs/adapter-bun: \`windows\` icon/metadata for ${outfile.slice(out.length + 1)} ` +
+								`was embedded via post-processing, not Bun's own mechanism, because Bun ignores ` +
+								`\`compile.windows\` when cross-compiling from ${process.platform}. This has been ` +
+								'verified structurally (resource content, section table, PE checksum) but not by ' +
+								'running the executable on Windows — please confirm it launches correctly before ' +
+								'shipping it.'
 						);
 					}
 				})

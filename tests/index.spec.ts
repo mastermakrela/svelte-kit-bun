@@ -2,11 +2,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+vi.mock('../src/windows-brand.js', () => ({ apply_windows_branding: vi.fn() }));
+
 import plugin from '../index.js';
+import { apply_windows_branding } from '../src/windows-brand.js';
 
 interface BunBuildCall {
 	entrypoints: string[];
-	compile: { outfile: string; target?: string };
+	compile: { outfile: string; target?: string; windows?: Record<string, unknown> };
 	target: string;
 }
 
@@ -19,10 +23,14 @@ function create_bun_mock(cwd: string, options: { build_success?: boolean } = {})
 		writes,
 		build_calls,
 		Bun: {
-			write: async (path: string, data: string) => {
-				writes.set(path, data);
+			write: async (path: string, data: string | ArrayBuffer) => {
 				mkdirSync(dirname(path), { recursive: true });
-				writeFileSync(path, data);
+				if (typeof data === 'string') {
+					writes.set(path, data);
+					writeFileSync(path, data);
+				} else {
+					writeFileSync(path, Buffer.from(data));
+				}
 			},
 			file: (path: string) => ({
 				exists: async () => {
@@ -33,10 +41,19 @@ function create_bun_mock(cwd: string, options: { build_success?: boolean } = {})
 						return false;
 					}
 				},
-				json: async () => JSON.parse(readFileSync(path, 'utf8'))
+				json: async () => JSON.parse(readFileSync(path, 'utf8')),
+				arrayBuffer: async () => {
+					const buf = readFileSync(path);
+					return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+				}
 			}),
 			build: async (opts: BunBuildCall) => {
 				build_calls.push(opts);
+				if (build_success) {
+					// simulate `--compile` writing the executable to disk
+					mkdirSync(dirname(opts.compile.outfile), { recursive: true });
+					writeFileSync(opts.compile.outfile, Buffer.from('FAKE_COMPILED_EXECUTABLE'));
+				}
 				return {
 					success: build_success,
 					logs: build_success ? [] : [{ message: 'mock build failure' }]
@@ -324,6 +341,139 @@ describe('adapt hook', () => {
 
 		// native addons work fine when not compiling to a single-file binary
 		expect(logs.warn).toHaveLength(0);
+	});
+});
+
+function set_platform(value: string) {
+	Object.defineProperty(process, 'platform', { value, configurable: true });
+}
+
+describe('windows option', () => {
+	let original_platform: NodeJS.Platform;
+
+	beforeEach(() => {
+		original_platform = process.platform;
+		vi.mocked(apply_windows_branding).mockReset();
+	});
+
+	afterEach(() => {
+		set_platform(original_platform);
+	});
+
+	test('post-processes the compiled executable when cross-compiling to bun-windows-* from a non-Windows host', async () => {
+		set_platform('darwin');
+		vi.mocked(apply_windows_branding).mockReturnValue(new TextEncoder().encode('PATCHED').buffer);
+
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, logs } = create_builder_mock(tmp_cwd);
+		const p = plugin({ targets: ['bun-windows-x64'], windows: { title: 'My App' } });
+		await p.adapt(builder as never);
+
+		// compile.windows is NOT passed to Bun.build — Bun would silently ignore it anyway
+		expect(mock.build_calls[0].compile.windows).toBeUndefined();
+
+		expect(apply_windows_branding).toHaveBeenCalledTimes(1);
+		const [, windows_arg, icon_arg] = vi.mocked(apply_windows_branding).mock.calls[0];
+		expect(windows_arg).toEqual({ title: 'My App' });
+		expect(icon_arg).toBeNull();
+
+		// the post-processed bytes were written back to the same outfile
+		const outfile = join(tmp_cwd, 'build/app-bun-windows-x64');
+		expect(readFileSync(outfile, 'utf8')).toBe('PATCHED');
+
+		expect(logs.warn.some((m) => m.includes('post-processing'))).toBe(true);
+	});
+
+	test('reads and forwards the icon file when windows.icon is set during cross-compile post-processing', async () => {
+		set_platform('darwin');
+		vi.mocked(apply_windows_branding).mockReturnValue(new ArrayBuffer(0));
+
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+		writeFileSync(join(tmp_cwd, 'icon.ico'), Buffer.from('FAKE_ICO_BYTES'));
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({ targets: ['bun-windows-x64'], windows: { icon: join(tmp_cwd, 'icon.ico') } });
+		await p.adapt(builder as never);
+
+		const [, , icon_arg] = vi.mocked(apply_windows_branding).mock.calls[0];
+		expect(Buffer.from(icon_arg as ArrayBuffer).toString()).toBe('FAKE_ICO_BYTES');
+	});
+
+	test('throws a clear error when windows.icon points to a missing file during cross-compile', async () => {
+		set_platform('darwin');
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({ targets: ['bun-windows-x64'], windows: { icon: 'does-not-exist.ico' } });
+		await expect(p.adapt(builder as never)).rejects.toThrow(/windows\.icon.*file not found/);
+		expect(apply_windows_branding).not.toHaveBeenCalled();
+	});
+
+	test('warns and skips (does not throw) when windows is set but no Windows target is built', async () => {
+		set_platform('darwin');
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, logs } = create_builder_mock(tmp_cwd);
+		const p = plugin({ targets: ['bun-linux-x64'], windows: { title: 'My App' } });
+		await p.adapt(builder as never);
+
+		expect(logs.warn.some((m) => m.includes('no Windows target is being built'))).toBe(true);
+		expect(mock.build_calls[0].compile.windows).toBeUndefined();
+	});
+
+	test('applies windows options natively for the implicit host build on a Windows host', async () => {
+		set_platform('win32');
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, logs } = create_builder_mock(tmp_cwd);
+		const p = plugin({
+			windows: {
+				icon: 'icon.ico',
+				hideConsole: true,
+				title: 'My App',
+				publisher: 'Acme',
+				version: '1.2.3.4',
+				description: 'An app',
+				copyright: '© Acme'
+			}
+		});
+		await p.adapt(builder as never);
+
+		expect(mock.build_calls).toHaveLength(1);
+		expect(mock.build_calls[0].compile.windows).toEqual({
+			icon: 'icon.ico',
+			hideConsole: true,
+			title: 'My App',
+			publisher: 'Acme',
+			version: '1.2.3.4',
+			description: 'An app',
+			copyright: '© Acme'
+		});
+		expect(logs.warn).toHaveLength(0);
+	});
+
+	test('applies windows options only to the bun-windows-* job among multiple targets on a Windows host', async () => {
+		set_platform('win32');
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({
+			targets: ['bun-linux-x64', 'bun-windows-x64'],
+			windows: { title: 'My App' }
+		});
+		await p.adapt(builder as never);
+
+		const windows_call = mock.build_calls.find((c) => c.compile.target === 'bun-windows-x64');
+		const linux_call = mock.build_calls.find((c) => c.compile.target === 'bun-linux-x64');
+		expect(windows_call?.compile.windows).toEqual({ title: 'My App' });
+		expect(linux_call?.compile.windows).toBeUndefined();
 	});
 });
 

@@ -46,6 +46,45 @@ interface AdapterOptions {
 	 * @default undefined
 	 */
 	targets?: string[];
+
+	/**
+	 * Icon and version metadata to embed in the compiled Windows executable,
+	 * mirroring `Bun.build`'s `compile.windows` shape. Only applied when a
+	 * Windows binary is actually being produced (a `bun-windows-*` target, or
+	 * the implicit host build when running on Windows itself).
+	 *
+	 * **When building natively on Windows**, this is passed straight through
+	 * to Bun's own `compile.windows`.
+	 *
+	 * **When cross-compiling a `bun-windows-*` target from macOS/Linux**, Bun
+	 * itself silently ignores these fields (its Windows resource embedding
+	 * depends on Windows APIs — see
+	 * https://bun.sh/docs/bundler/executables#windows-specific-flags). Since
+	 * that's this adapter's main real-world use case, the adapter instead
+	 * post-processes the compiled executable's PE resources directly (icon,
+	 * version info) and, for `hideConsole`, the subsystem flag. This has been
+	 * verified structurally — resource content, section table layout, PE
+	 * checksum, and the integrity of Bun's own embedded-asset payload were all
+	 * confirmed unchanged apart from the intended edits — but the resulting
+	 * executable has not been run on Windows as part of that verification.
+	 * Confirm it launches correctly before shipping it.
+	 */
+	windows?: {
+		/** Path to a `.ico` file to embed as the executable's icon. */
+		icon?: string;
+		/** Suppress the console window when the executable runs. */
+		hideConsole?: boolean;
+		/** Product name shown in the executable's version info / Properties dialog. */
+		title?: string;
+		/** Company/publisher name shown in the executable's version info. */
+		publisher?: string;
+		/** Version string, e.g. `1.2.3.4`. */
+		version?: string;
+		/** File description shown in the executable's version info. */
+		description?: string;
+		/** Copyright string shown in the executable's version info. */
+		copyright?: string;
+	};
 }
 
 export default function plugin(options?: AdapterOptions): Adapter;
