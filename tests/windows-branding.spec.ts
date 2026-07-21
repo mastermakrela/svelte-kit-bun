@@ -12,6 +12,16 @@ const fixture_entry = join(__dirname, 'fixtures/windows-branding/entry.js');
 const icon_path = join(__dirname, 'fixtures/windows-branding/icon.ico');
 
 /**
+ * `Buffer#buffer` is a view into Node's underlying `ArrayBuffer`, which for
+ * small reads may be a larger, shared pool allocation (default pool size
+ * 8 KiB) — using it directly without slicing by `byteOffset`/`byteLength`
+ * can hand downstream code bytes from unrelated allocations.
+ */
+function to_array_buffer(buf: Buffer): ArrayBuffer {
+	return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+}
+
+/**
  * Real, unmocked coverage for `apply_windows_branding`: this cross-compiles an
  * actual `bun-windows-x64` executable (the same layout `@sveltejs/adapter-bun`
  * produces), patches it, and re-parses the result to confirm the icon/version
@@ -34,7 +44,7 @@ describe('apply_windows_branding against a real cross-compiled executable', () =
 		if (build.status !== 0) {
 			throw new Error(`bun build --compile --target=bun-windows-x64 failed (status ${build.status})`);
 		}
-		original_bytes = readFileSync(outfile).buffer as ArrayBuffer;
+		original_bytes = to_array_buffer(readFileSync(outfile));
 	}, 60_000);
 
 	afterAll(() => {
@@ -42,7 +52,7 @@ describe('apply_windows_branding against a real cross-compiled executable', () =
 	});
 
 	test('embeds icon and version metadata, leaving the `.bun` marker section intact', () => {
-		const icon_bytes = readFileSync(icon_path).buffer as ArrayBuffer;
+		const icon_bytes = to_array_buffer(readFileSync(icon_path));
 
 		const patched = apply_windows_branding(
 			original_bytes,
