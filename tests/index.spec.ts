@@ -49,14 +49,21 @@ function create_bun_mock(cwd: string, options: { build_success?: boolean } = {})
 			}),
 			build: async (opts: BunBuildCall) => {
 				build_calls.push(opts);
+				// Mirror real Bun.build: for a `bun-windows-*` target, an `outfile`
+				// with no extension gets `.exe` appended automatically.
+				let compiled_path = opts.compile.outfile;
+				if (opts.compile.target?.startsWith('bun-windows') && !/\.[^/\\]+$/.test(compiled_path)) {
+					compiled_path += '.exe';
+				}
 				if (build_success) {
 					// simulate `--compile` writing the executable to disk
-					mkdirSync(dirname(opts.compile.outfile), { recursive: true });
-					writeFileSync(opts.compile.outfile, Buffer.from('FAKE_COMPILED_EXECUTABLE'));
+					mkdirSync(dirname(compiled_path), { recursive: true });
+					writeFileSync(compiled_path, Buffer.from('FAKE_COMPILED_EXECUTABLE'));
 				}
 				return {
 					success: build_success,
-					logs: build_success ? [] : [{ message: 'mock build failure' }]
+					logs: build_success ? [] : [{ message: 'mock build failure' }],
+					outputs: build_success ? [{ path: compiled_path, kind: 'entry-point' }] : []
 				};
 			}
 		},
@@ -379,8 +386,10 @@ describe('windows option', () => {
 		expect(windows_arg).toEqual({ title: 'My App' });
 		expect(icon_arg).toBeNull();
 
-		// the post-processed bytes were written back to the same outfile
-		const outfile = join(tmp_cwd, 'build/app-bun-windows-x64');
+		// the post-processed bytes were written back to the actual compiled path —
+		// which Bun names with a `.exe` suffix it appends itself, not the bare
+		// `outfile` the adapter asked for.
+		const outfile = join(tmp_cwd, 'build/app-bun-windows-x64.exe');
 		expect(readFileSync(outfile, 'utf8')).toBe('PATCHED');
 
 		expect(logs.warn.some((m) => m.includes('post-processing'))).toBe(true);

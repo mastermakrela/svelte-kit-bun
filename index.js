@@ -1,3 +1,4 @@
+import { basename } from 'node:path';
 import { generate_entry } from './src/codegen.js';
 import { apply_windows_branding } from './src/windows-brand.js';
 
@@ -170,8 +171,14 @@ export default function plugin(opts = {}) {
 					}
 
 					if (windows && windows_job && cross_compiling_windows) {
+						// Bun silently appends `.exe` to `outfile` for Windows targets when it's
+						// missing an extension, so the file actually on disk isn't necessarily
+						// `outfile` itself — `result.outputs` gives the real compiled path.
+						const compiled_path =
+							result.outputs.find((o) => o.kind === 'entry-point')?.path ?? outfile;
+
 						builder.log.minor(
-							`Applying \`windows\` icon/metadata to ${outfile.slice(out.length + 1)} (post-processed; cross-compiled from ${process.platform})`
+							`Applying \`windows\` icon/metadata to ${basename(compiled_path)} (post-processed; cross-compiled from ${process.platform})`
 						);
 
 						let icon_bytes = null;
@@ -185,12 +192,12 @@ export default function plugin(opts = {}) {
 							icon_bytes = await icon_file.arrayBuffer();
 						}
 
-						const exe_bytes = await Bun.file(outfile).arrayBuffer();
+						const exe_bytes = await Bun.file(compiled_path).arrayBuffer();
 						const patched = apply_windows_branding(exe_bytes, windows, icon_bytes);
-						await Bun.write(outfile, patched);
+						await Bun.write(compiled_path, patched);
 
 						builder.log.warn(
-							`@sveltejs/adapter-bun: \`windows\` icon/metadata for ${outfile.slice(out.length + 1)} ` +
+							`@sveltejs/adapter-bun: \`windows\` icon/metadata for ${basename(compiled_path)} ` +
 								`was embedded via post-processing, not Bun's own mechanism, because Bun ignores ` +
 								`\`compile.windows\` when cross-compiling from ${process.platform}. This has been ` +
 								'verified structurally (resource content, section table, PE checksum) but not by ' +
