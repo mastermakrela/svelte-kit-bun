@@ -1,84 +1,29 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process';
-import { createServer } from 'node:net';
-import { readFileSync, rmSync, existsSync } from 'node:fs';
-import type { Readable } from 'node:stream';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+	build_fixture,
+	fixture,
+	start_app,
+	stop_app,
+	type SpawnedServer
+} from '../helpers/fixture.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const fixture = join(__dirname, 'fixtures/basic-app');
 const binary = join(fixture, 'build/app');
 
-/** Find a free TCP port by opening an ephemeral listener and reading its address. */
-function free_port(): Promise<number> {
-	return new Promise((resolve, reject) => {
-		const srv = createServer();
-		srv.unref();
-		srv.on('error', reject);
-		srv.listen(0, '127.0.0.1', () => {
-			const addr = srv.address();
-			if (!addr || typeof addr === 'string') {
-				srv.close();
-				reject(new Error('no port'));
-				return;
-			}
-			const port = addr.port;
-			srv.close(() => resolve(port));
-		});
-	});
-}
-
-async function wait_for_http(url: string, timeout_ms: number) {
-	const deadline = Date.now() + timeout_ms;
-	while (Date.now() < deadline) {
-		try {
-			const res = await fetch(url, { signal: AbortSignal.timeout(500) });
-			await res.arrayBuffer();
-			return;
-		} catch {
-			await new Promise((r) => setTimeout(r, 100));
-		}
-	}
-	throw new Error(`server did not become ready at ${url} within ${timeout_ms}ms`);
-}
-
-let server: ChildProcessByStdio<null, Readable, Readable> | null = null;
+let server: SpawnedServer | null = null;
 let base_url = '';
 
 beforeAll(async () => {
-	rmSync(join(fixture, 'build'), { recursive: true, force: true });
-	rmSync(join(fixture, '.svelte-kit'), { recursive: true, force: true });
-
-	const build = spawnSync('bun', ['run', 'build'], {
-		cwd: fixture,
-		stdio: 'inherit'
-	});
-	if (build.status !== 0) {
-		throw new Error(`bun run build failed (status ${build.status})`);
-	}
+	build_fixture();
 	if (!existsSync(binary)) {
 		throw new Error(`expected compiled binary at ${binary}`);
 	}
 
-	const port = await free_port();
-	base_url = `http://127.0.0.1:${port}`;
-	server = spawn(binary, [], {
-		env: { ...process.env, HOST: '127.0.0.1', PORT: String(port) },
-		stdio: ['ignore', 'pipe', 'pipe']
-	});
-	server.stdout.on('data', (b) => process.stdout.write(`[app stdout] ${b}`));
-	server.stderr.on('data', (b) => process.stderr.write(`[app stderr] ${b}`));
-
-	await wait_for_http(`${base_url}/about`, 15_000);
+	({ base_url, server } = await start_app([binary]));
 }, 180_000);
 
-afterAll(async () => {
-	if (!server) return;
-	server.kill('SIGTERM');
-	await new Promise((r) => setTimeout(r, 100));
-	if (server.exitCode === null) server.kill('SIGKILL');
-});
+afterAll(() => stop_app(server));
 
 /** Normalize a ref that may be `./foo` or `/foo` to an absolute URL path `/foo`. */
 function abs(ref: string): string {
@@ -214,5 +159,99 @@ describe('compiled executable bundling', () => {
 		const bytes = new Uint8Array(await res.arrayBuffer());
 		expect(bytes.byteLength).toBe(16);
 		expect(Buffer.from(bytes).equals(on_disk.subarray(0, 16))).toBe(true);
+	});
+});
+
+describe('without a server instrumentation file', () => {
+	test('the entry is not instrumented and no instrumentation runs', async () => {
+		expect(readFileSync(join(fixture, 'build/entry.js'), 'utf8')).toContain('await start({');
+
+		const res = await fetch(`${base_url}/instrumentation`);
+		expect(await res.json()).toEqual({ order: ['app'], marker: null });
+	});
+});
+
+// Parity with `@sveltejs/adapter-node`'s `handler.js`.
+describe('response semantics', () => {
+	test('static MIME type comes from the manifest, not Bun’s extension mapping', async () => {
+		// `Bun.file('*.jxl').type` is `application/octet-stream`; SvelteKit's manifest
+		// records `image/jxl`, so this only passes if the manifest is the source of truth.
+		const res = await fetch(`${base_url}/custom.jxl`);
+		expect(res.status).toBe(200);
+		expect(res.headers.get('content-type')).toBe('image/jxl');
+	});
+
+	test('static MIME types equal the manifest’s metadata exactly', async () => {
+		const manifest_source = readFileSync(join(fixture, 'build/server/manifest.js'), 'utf8');
+		const mime_types = JSON.parse(
+			manifest_source.match(/mimeTypes: (\{.*?\}),\n/s)![1]
+		) as Record<string, string>;
+		expect(mime_types['.jxl']).toBe('image/jxl');
+
+		for (const [path, ext] of [
+			['/favicon.png', '.png'],
+			['/extra.css', '.css'],
+			['/hello.txt', '.txt'],
+			['/custom.jxl', '.jxl']
+		] as const) {
+			const res = await fetch(`${base_url}${path}`);
+			await res.arrayBuffer();
+			expect(res.headers.get('content-type'), path).toBe(mime_types[ext]);
+		}
+	});
+
+	test('immutable client assets get a long-lived immutable cache-control', async () => {
+		const html = await fetch(`${base_url}/assets`).then((r) => r.text());
+		const css_href = html.match(/href="((?:\/|\.\/)_app\/immutable\/assets\/[^"]+\.css)"/)?.[1];
+		expect(css_href).toBeTruthy();
+
+		const res = await fetch(`${base_url}${abs(css_href!)}`);
+		await res.arrayBuffer();
+		expect(res.status).toBe(200);
+		expect(res.headers.get('cache-control')).toBe('public,max-age=31536000,immutable');
+	});
+
+	test('non-immutable client assets are not cached forever', async () => {
+		for (const path of ['/favicon.png', '/_app/version.json']) {
+			const res = await fetch(`${base_url}${path}`);
+			await res.arrayBuffer();
+			expect(res.status, path).toBe(200);
+			expect(res.headers.get('cache-control') ?? '', path).not.toMatch(/immutable/);
+		}
+	});
+
+	test('prerendered slash redirect uses a relative location (survives a stripped proxy prefix)', async () => {
+		const res = await fetch(`${base_url}/about/`, { redirect: 'manual' });
+		await res.arrayBuffer();
+		expect(res.status).toBe(308);
+		// relative, so a proxy mounted at e.g. `/app` resolves it to `/app/about`
+		expect(res.headers.get('location')).toBe('../about');
+	});
+
+	test('prerendered slash redirect keeps the query string', async () => {
+		const res = await fetch(`${base_url}/about/?q=1&x=2`, { redirect: 'manual' });
+		await res.arrayBuffer();
+		expect(res.status).toBe(308);
+		expect(res.headers.get('location')).toBe('../about?q=1&x=2');
+	});
+
+	test('relative slash redirect resolves back to the prerendered page', async () => {
+		const res = await fetch(`${base_url}/about/`);
+		expect(res.status).toBe(200);
+		expect(await res.text()).toContain('About (prerendered)');
+	});
+
+	test('SSE responses opt out of nginx-style buffering', async () => {
+		const res = await fetch(`${base_url}/stream`);
+		expect(res.status).toBe(200);
+		expect(res.headers.get('content-type')).toBe('text/event-stream');
+		expect(res.headers.get('x-accel-buffering')).toBe('no');
+		expect(await res.text()).toContain('data: tick 0');
+	});
+
+	test('non-streaming responses do not get x-accel-buffering', async () => {
+		const res = await fetch(`${base_url}/`);
+		await res.arrayBuffer();
+		expect(res.headers.get('x-accel-buffering')).toBeNull();
 	});
 });

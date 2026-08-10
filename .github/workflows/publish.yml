@@ -17,7 +17,9 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # pinned to the Bun version the suite is verified against (see test.yml);
+          # a release should never be gated on whatever `latest` happens to be
+          bun-version: '1.3.14'
 
       - uses: actions/setup-node@v4
         with:

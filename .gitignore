@@ -3,4 +3,5 @@ node_modules
 coverage/
 tests/fixtures/*/.svelte-kit
 tests/fixtures/*/build
+tests/fixtures/*/build-*
 tests/fixtures/*/node_modules

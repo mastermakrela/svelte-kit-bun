@@ -37,6 +37,7 @@ function render_asset_group(entries, prefix) {
  * @param {AssetEntry[]} options.client_assets      - key = URL path
  * @param {AssetEntry[]} options.prerendered_assets - key = URL path
  * @param {AssetEntry[]} options.server_assets      - key = manifest._.server_assets entry name
+ * @param {string} [options.origin]                 - `kit.paths.origin`, baked in at build time
  * @param {string} [options.env_prefix]             - optional prefix for HOST, PORT, etc.
  * @returns {string}
  */
@@ -47,6 +48,7 @@ export function generate_entry({
 	client_assets,
 	prerendered_assets,
 	server_assets,
+	origin,
 	env_prefix = ''
 }) {
 	const client = render_asset_group(client_assets, '_client');
@@ -62,17 +64,20 @@ export function generate_entry({
 	const asset_imports = [...client.imports, ...prerendered.imports, ...server.imports];
 
 	const start_args = [
-		'\tServer,',
-		'\tmanifest,',
-		'\tprerendered,',
-		'\tclient_assets,',
-		'\tprerendered_assets,',
-		'\tserver_assets'
+		'Server',
+		'manifest',
+		'prerendered',
+		'client_assets',
+		'prerendered_assets',
+		'server_assets'
 	];
 
+	if (origin !== undefined) {
+		start_args.push(`origin: ${JSON.stringify(origin)}`);
+	}
+
 	if (env_prefix !== '') {
-		start_args[start_args.length - 1] += ',';
-		start_args.push(`\tenv_prefix: ${JSON.stringify(env_prefix)}`);
+		start_args.push(`env_prefix: ${JSON.stringify(env_prefix)}`);
 	}
 
 	const lines = [
@@ -85,7 +90,7 @@ export function generate_entry({
 		`const server_assets = ${server.map};`,
 		'',
 		'await start({',
-		...start_args,
+		start_args.map((arg) => `\t${arg}`).join(',\n'),
 		'});',
 		''
 	];

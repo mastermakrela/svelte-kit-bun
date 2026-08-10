@@ -88,6 +88,42 @@ describe('generate_entry', () => {
 		expect(with_prefix).not.toMatch(/,\s*\}/);
 	});
 
+	test('origin is emitted only when defined', () => {
+		const without = generate_entry({
+			...defaults,
+			client_assets: [],
+			prerendered_assets: [],
+			server_assets: []
+		});
+		expect(without).not.toContain('origin');
+
+		const with_origin = generate_entry({
+			...defaults,
+			client_assets: [],
+			prerendered_assets: [],
+			server_assets: [],
+			origin: 'https://example.com'
+		});
+		expect(with_origin).toContain('\tserver_assets,\n\torigin: "https://example.com"');
+		expect(with_origin).not.toMatch(/,\s*\}/);
+	});
+
+	test('origin and env_prefix are emitted together in a stable order', () => {
+		const output = generate_entry({
+			...defaults,
+			client_assets: [],
+			prerendered_assets: [],
+			server_assets: [],
+			origin: 'https://example.com',
+			env_prefix: 'MY_APP_'
+		});
+
+		expect(output).toContain(
+			'\tserver_assets,\n\torigin: "https://example.com",\n\tenv_prefix: "MY_APP_"'
+		);
+		expect(output).not.toMatch(/,\s*\}/);
+	});
+
 	test('special characters in keys and import paths survive JSON.stringify', () => {
 		const output = generate_entry({
 			...defaults,

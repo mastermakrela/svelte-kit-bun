@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 vi.mock('../src/windows-brand.js', () => ({ apply_windows_branding: vi.fn() }));
 
@@ -12,6 +12,8 @@ interface BunBuildCall {
 	entrypoints: string[];
 	compile: { outfile: string; target?: string; windows?: Record<string, unknown> };
 	target: string;
+	/** contents of `entrypoints[0]` at the time the build was requested */
+	entry_source?: string;
 }
 
 function create_bun_mock(cwd: string, options: { build_success?: boolean } = {}) {
@@ -48,7 +50,10 @@ function create_bun_mock(cwd: string, options: { build_success?: boolean } = {})
 				}
 			}),
 			build: async (opts: BunBuildCall) => {
-				build_calls.push(opts);
+				build_calls.push({
+					...opts,
+					entry_source: readFileSync(opts.entrypoints[0], 'utf8')
+				});
 				// Mirror real Bun.build: for a `bun-windows-*` target, an `outfile`
 				// with no extension gets `.exe` appended automatically.
 				let compiled_path = opts.compile.outfile;
@@ -71,23 +76,30 @@ function create_bun_mock(cwd: string, options: { build_success?: boolean } = {})
 	};
 }
 
+interface InstrumentCall {
+	entrypoint: string;
+	instrumentation: string;
+	start?: string;
+	module?: { exports: string[] };
+}
+
 interface BuilderMock {
 	builder: {
-		config: { kit: { paths: { base: string }; appDir: string } };
+		config: { kit: { paths: { base: string; origin?: string }; appDir: string } };
 		log: {
 			minor: (msg: string) => void;
 			warn: (msg: string) => void;
 			error: (msg: string) => void;
 		};
 		getBuildDirectory: (name: string) => string;
-		rimraf: (dir: string) => void;
-		mkdirp: (dir: string) => void;
 		writeClient: (dir: string) => string[];
 		writePrerendered: (dir: string) => string[];
 		writeServer: (dir: string) => string[];
 		copy: (from: string, to: string) => void;
 		generateManifest: (opts: { relativePath: string }) => string;
 		findServerAssets: (routes: unknown[]) => string[];
+		hasServerInstrumentationFile: () => boolean;
+		instrument: (args: InstrumentCall) => void;
 		prerendered: {
 			paths: string[];
 			pages: Map<string, { file: string }>;
@@ -97,15 +109,21 @@ interface BuilderMock {
 	};
 	logs: { minor: string[]; warn: string[]; error: string[] };
 	copies: Array<{ from: string; to: string }>;
+	instrument_calls: InstrumentCall[];
 }
 
-function create_builder_mock(cwd: string): BuilderMock {
+function create_builder_mock(
+	cwd: string,
+	{ instrumentation = false }: { instrumentation?: boolean } = {}
+): BuilderMock {
 	const logs = { minor: [] as string[], warn: [] as string[], error: [] as string[] };
 	const copies: Array<{ from: string; to: string }> = [];
+	const instrument_calls: InstrumentCall[] = [];
 
 	return {
 		logs,
 		copies,
+		instrument_calls,
 		builder: {
 			config: { kit: { paths: { base: '' }, appDir: '_app' } },
 			log: {
@@ -114,22 +132,39 @@ function create_builder_mock(cwd: string): BuilderMock {
 				error: (msg: string) => logs.error.push(msg)
 			},
 			getBuildDirectory: (name: string) => join(cwd, '.svelte-kit', name),
-			rimraf: (dir: string) => {
-				try {
-					rmSync(dir, { recursive: true, force: true });
-				} catch {
-					// ignore
-				}
-			},
-			mkdirp: () => {},
 			writeClient: () => ['favicon.png', '_app/immutable/chunks/abc.js'],
 			writePrerendered: () => [],
-			writeServer: () => [],
+			// kit emits `instrumentation.server.js` into the server output, so it lands in
+			// the adapter's output directory as part of `writeServer`
+			writeServer: (dir: string) => {
+				if (instrumentation) {
+					mkdirSync(dir, { recursive: true });
+					writeFileSync(`${dir}/instrumentation.server.js`, '// instrumentation\n');
+				}
+				return [];
+			},
 			copy: (from: string, to: string) => {
 				copies.push({ from, to });
 			},
 			generateManifest: ({ relativePath }) => `{relative:${JSON.stringify(relativePath)}}`,
 			findServerAssets: () => ['data.bin'],
+			hasServerInstrumentationFile: () => instrumentation,
+			// mirrors `create_builder`'s implementation: move the entrypoint aside and
+			// replace it with a facade that imports the instrumentation module first
+			instrument: (args: InstrumentCall) => {
+				instrument_calls.push(args);
+				// kit refuses to instrument if either file is missing
+				for (const file of [args.entrypoint, args.instrumentation]) {
+					if (!existsSync(file)) throw new Error(`${file} not found`);
+				}
+				const start = args.start ?? join(dirname(args.entrypoint), 'start.js');
+				writeFileSync(start, readFileSync(args.entrypoint, 'utf8'));
+				writeFileSync(
+					args.entrypoint,
+					`import './${relative(dirname(args.entrypoint), args.instrumentation)}';\n` +
+						`const __mod = await import('./${relative(dirname(args.entrypoint), start)}');\n`
+				);
+			},
 			prerendered: {
 				paths: ['/about'],
 				pages: new Map([['/about', { file: 'about.html' }]]),
@@ -157,6 +192,7 @@ afterEach(() => {
 		// ignore
 	}
 	vi.unstubAllGlobals();
+	vi.unstubAllEnvs();
 });
 
 describe('plugin metadata', () => {
@@ -168,6 +204,72 @@ describe('plugin metadata', () => {
 	test('supports.read returns true', () => {
 		const p = plugin();
 		expect(p.supports?.read?.({ config: {}, route: { id: '/x' } } as never)).toBe(true);
+	});
+
+	// without this, kit refuses to build an app that has `src/instrumentation.server.js`
+	test('supports.instrumentation returns true', () => {
+		const p = plugin();
+		expect(p.supports?.instrumentation?.()).toBe(true);
+	});
+});
+
+describe('server instrumentation', () => {
+	test('does not instrument the entry when the app has no instrumentation file', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, instrument_calls } = create_builder_mock(tmp_cwd);
+		await plugin().adapt(builder as never);
+
+		expect(instrument_calls).toHaveLength(0);
+		expect(mock.build_calls[0].entry_source).toContain('await start({');
+	});
+
+	test('instruments the generated entry with the emitted instrumentation module', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, instrument_calls } = create_builder_mock(tmp_cwd, { instrumentation: true });
+		await plugin({ out: 'build' }).adapt(builder as never);
+
+		expect(instrument_calls).toEqual([
+			{
+				entrypoint: 'build/entry.js',
+				instrumentation: 'build/server/instrumentation.server.js',
+				module: { exports: [] }
+			}
+		]);
+	});
+
+	test('compiles the instrumented facade, not the original entry', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd, { instrumentation: true });
+		await plugin({ out: 'build' }).adapt(builder as never);
+
+		// the entry Bun compiles must load instrumentation before the app, so it has to
+		// be the facade written by `builder.instrument` — i.e. instrumenting happens
+		// before `Bun.build`, and the real entry moved to `start.js`
+		const entry_source = mock.build_calls[0].entry_source!;
+		expect(mock.build_calls[0].entrypoints).toEqual(['build/entry.js']);
+		expect(entry_source).toContain("import './server/instrumentation.server.js';");
+		expect(entry_source).toContain("await import('./start.js')");
+		expect(entry_source).not.toContain('await start({');
+		expect(readFileSync(join(tmp_cwd, 'build/start.js'), 'utf8')).toContain('await start({');
+	});
+
+	test('instruments the entry even when compile is disabled', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, instrument_calls } = create_builder_mock(tmp_cwd, { instrumentation: true });
+		await plugin({ compile: false }).adapt(builder as never);
+
+		expect(instrument_calls).toHaveLength(1);
+		expect(readFileSync(join(tmp_cwd, 'build/entry.js'), 'utf8')).toContain(
+			"import './server/instrumentation.server.js';"
+		);
 	});
 });
 
@@ -500,5 +602,46 @@ describe('base path handling', () => {
 		const entry = mock.writes.get('build/entry.js')!;
 		expect(entry).toContain('import _client_0 from "./client/my-app/favicon.png"');
 		expect(entry).toContain('"/my-app/favicon.png": _client_0');
+	});
+});
+
+describe('kit.paths.origin handling', () => {
+	test('bakes a configured origin into the generated entry', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		builder.config.kit.paths.origin = 'https://example.com';
+
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).toContain('origin: "https://example.com"');
+	});
+
+	test('omits origin from the generated entry when unset', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).not.toContain('origin:');
+	});
+
+	test('an ORIGIN environment variable at build time has no effect', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+		vi.stubEnv('ORIGIN', 'https://from-env.example.com');
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).not.toContain('from-env.example.com');
 	});
 });

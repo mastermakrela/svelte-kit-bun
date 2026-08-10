@@ -5,11 +5,11 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { NtExecutable, NtExecutableResource, Resource } from 'resedit';
-import { apply_windows_branding, hide_bun_marker_section } from '../src/windows-brand.js';
+import { apply_windows_branding, hide_bun_marker_section } from '../../src/windows-brand.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const fixture_entry = join(__dirname, 'fixtures/windows-branding/entry.js');
-const icon_path = join(__dirname, 'fixtures/windows-branding/icon.ico');
+const fixture_entry = join(__dirname, '../fixtures/windows-branding/entry.js');
+const icon_path = join(__dirname, '../fixtures/windows-branding/icon.ico');
 
 /**
  * `Buffer#buffer` is a view into Node's underlying `ArrayBuffer`, which for

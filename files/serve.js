@@ -4,6 +4,170 @@ const BUN_MAX_IDLE_TIMEOUT_S = 255;
 const XFF = 'x-forwarded-for';
 
 /**
+ * Environment variables the runtime reads, without the `envPrefix`. When an
+ * `envPrefix` is configured, any *other* prefixed variable is a configuration
+ * mistake and `validate_env` throws — same contract as adapter-node's `env.js`.
+ */
+export const SUPPORTED_ENV_VARS = new Set([
+	'HOST',
+	'PORT',
+	'XFF_DEPTH',
+	'ADDRESS_HEADER',
+	'PROTOCOL_HEADER',
+	'HOST_HEADER',
+	'PORT_HEADER',
+	'BODY_SIZE_LIMIT',
+	'SHUTDOWN_TIMEOUT',
+	'CONNECTION_IDLE_TIMEOUT'
+]);
+
+/**
+ * adapter-node variables that have no counterpart here, mapped to the reason.
+ * They are rejected (with an `envPrefix`) or warned about (without one) rather
+ * than silently ignored, and rather than quietly repurposed for something that
+ * happens to share a name.
+ */
+export const UNSUPPORTED_ENV_VARS = new Map([
+	[
+		'IDLE_TIMEOUT',
+		"in adapter-node this shuts the process down after a period with no requests, which only applies under systemd socket activation — a feature adapter-bun doesn't implement. For Bun.serve's per-connection idle timeout use CONNECTION_IDLE_TIMEOUT"
+	],
+	[
+		'SOCKET_PATH',
+		'adapter-bun always listens on a TCP host/port; listening on a unix socket is not implemented'
+	],
+	[
+		'KEEP_ALIVE_TIMEOUT',
+		'Bun.serve has no separate keep-alive timeout; CONNECTION_IDLE_TIMEOUT covers idle connections'
+	],
+	[
+		'HEADERS_TIMEOUT',
+		'Bun.serve has no separate headers timeout; CONNECTION_IDLE_TIMEOUT covers connections that stop sending data'
+	],
+	['LISTEN_PID', 'socket activation is not supported'],
+	['LISTEN_FDS', 'socket activation is not supported']
+]);
+
+/**
+ * Fail fast on prefixed variables the runtime does not understand (a mistyped or
+ * colliding `envPrefix` would otherwise be silently ignored), and on
+ * adapter-node-only variables that would otherwise look like they did something.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @param {string} env_prefix
+ * @param {(message: string) => void} warn
+ */
+export function validate_env(env, env_prefix, warn) {
+	for (const [name, reason] of UNSUPPORTED_ENV_VARS) {
+		const prefixed = `${env_prefix}${name}`;
+		if (env[prefixed] === undefined) continue;
+
+		const message = `${prefixed} is not supported by @sveltejs/adapter-bun: ${reason}`;
+		// Without a prefix the variable may well belong to something else in the
+		// environment, so warn rather than refusing to boot.
+		if (env_prefix) throw new Error(message);
+		warn(`${message}. It is being ignored`);
+	}
+
+	if (!env_prefix) return;
+
+	for (const name in env) {
+		if (!name.startsWith(env_prefix)) continue;
+		const unprefixed = name.slice(env_prefix.length);
+		if (!SUPPORTED_ENV_VARS.has(unprefixed)) {
+			throw new Error(
+				`You should change envPrefix (${env_prefix}) to avoid conflicts with existing environment variables — unexpectedly saw ${name}`
+			);
+		}
+	}
+}
+
+/**
+ * Read and validate the runtime configuration from the environment.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @param {string} [env_prefix]
+ * @param {(message: string) => void} [warn]
+ */
+export function read_config(
+	env,
+	env_prefix = '',
+	warn = (message) => process.stderr.write(`adapter-bun: ${message}\n`)
+) {
+	validate_env(env, env_prefix, warn);
+
+	/**
+	 * @param {string} name
+	 * @param {string} fallback
+	 * @returns {string}
+	 */
+	const read_env = (name, fallback) => env[`${env_prefix}${name}`] ?? fallback;
+
+	const port = Number(read_env('PORT', '3000'));
+	if (!Number.isInteger(port) || port < 0 || port > 65535) {
+		throw new Error(`${env_prefix}PORT must be an integer between 0 and 65535`);
+	}
+
+	const xff_depth = Number(read_env('XFF_DEPTH', '1'));
+	if (!Number.isInteger(xff_depth) || xff_depth < 1) {
+		throw new Error(`${env_prefix}XFF_DEPTH must be a positive integer`);
+	}
+
+	return {
+		host: read_env('HOST', '0.0.0.0'),
+		port,
+		xff_depth,
+		address_header: read_env('ADDRESS_HEADER', '').toLowerCase(),
+		protocol_header: read_env('PROTOCOL_HEADER', '').toLowerCase(),
+		host_header: read_env('HOST_HEADER', '').toLowerCase(),
+		port_header: read_env('PORT_HEADER', '').toLowerCase(),
+		body_size_limit: parse_as_bytes(
+			read_env('BODY_SIZE_LIMIT', '512K'),
+			`${env_prefix}BODY_SIZE_LIMIT`
+		),
+		// Bun.serve's own default is 10s, which closes any connection that goes
+		// quiet for 10s — including an in-flight request whose handler hasn't
+		// written bytes yet, and a slow server-sent-events stream. Default to `0`
+		// (no timeout) so quiet long-lived responses are never cut off silently.
+		connection_idle_timeout: parse_timeout(
+			read_env('CONNECTION_IDLE_TIMEOUT', '0'),
+			`${env_prefix}CONNECTION_IDLE_TIMEOUT`,
+			BUN_MAX_IDLE_TIMEOUT_S
+		),
+		shutdown_timeout: parse_timeout(
+			read_env('SHUTDOWN_TIMEOUT', '30'),
+			`${env_prefix}SHUTDOWN_TIMEOUT`
+		)
+	};
+}
+
+/**
+ * Parse a timeout in whole seconds, mirroring adapter-node's `timeout_env`.
+ *
+ * @param {string} value
+ * @param {string} env_name
+ * @param {number} [max]
+ * @returns {number}
+ */
+export function parse_timeout(value, env_name, max) {
+	if (!/^\d+$/.test(value)) {
+		throw new Error(
+			`${env_name} must be a non-negative integer number of seconds (got '${value}')`
+		);
+	}
+
+	const seconds = Number(value);
+	if (max !== undefined && seconds > max) {
+		throw new Error(`${env_name} must be at most ${max} seconds (got '${value}')`);
+	}
+
+	return seconds;
+}
+
+// Hashed `/{appPath}/immutable/*` files never change, so they can be cached forever.
+const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
+
+/**
  * Runtime for adapter-bun. Invoked from the codegen-emitted entry.js with the
  * Server class, manifest, and asset maps already resolved to $bunfs paths.
  *
@@ -14,6 +178,7 @@ const XFF = 'x-forwarded-for';
  * @param {Record<string, string>} options.client_assets      URL path -> $bunfs file path
  * @param {Record<string, string>} options.prerendered_assets URL path -> $bunfs file path
  * @param {Record<string, string>} options.server_assets      manifest asset key -> $bunfs file path
+ * @param {string} [options.origin]      `kit.paths.origin`, baked in at build time
  * @param {string} [options.env_prefix]
  * @returns {Promise<import('bun').Server<unknown>>}
  */
@@ -24,8 +189,24 @@ export async function start({
 	client_assets,
 	prerendered_assets,
 	server_assets,
+	origin,
 	env_prefix = ''
 }) {
+	// read the environment before starting the app: an unusable configuration
+	// should fail immediately, not after `server.init()` ran side effects
+	const {
+		host,
+		port,
+		xff_depth,
+		address_header,
+		protocol_header,
+		host_header,
+		port_header,
+		body_size_limit,
+		connection_idle_timeout,
+		shutdown_timeout
+	} = read_config(process.env, env_prefix);
+
 	const server = new Server(manifest);
 
 	await server.init({
@@ -33,54 +214,22 @@ export async function start({
 		read: (file) => Bun.file(server_assets[file]).stream()
 	});
 
-	/**
-	 * @param {string} name
-	 * @param {string} fallback
-	 * @returns {string}
-	 */
-	const read_env = (name, fallback) => process.env[`${env_prefix}${name}`] ?? fallback;
-
-	/** @param {string} name */
-	const read_opt_env = (name) => process.env[`${env_prefix}${name}`];
-
-	const host = read_env('HOST', '0.0.0.0');
-	const port = Number(read_env('PORT', '3000'));
-	if (!Number.isInteger(port) || port < 0 || port > 65535) {
-		throw new Error(`${env_prefix}PORT must be an integer between 0 and 65535`);
-	}
-
-	const origin_env = parse_origin(read_opt_env('ORIGIN'), `${env_prefix}ORIGIN`);
-	const xff_depth = Number(read_env('XFF_DEPTH', '1'));
-	if (!Number.isInteger(xff_depth) || xff_depth < 1) {
-		throw new Error(`${env_prefix}XFF_DEPTH must be a positive integer`);
-	}
-	const address_header = read_env('ADDRESS_HEADER', '').toLowerCase();
-	const protocol_header = read_env('PROTOCOL_HEADER', '').toLowerCase();
-	const host_header = read_env('HOST_HEADER', '').toLowerCase();
-	const port_header = read_env('PORT_HEADER', '').toLowerCase();
-	const body_size_limit = parse_as_bytes(
-		read_env('BODY_SIZE_LIMIT', '512K'),
-		`${env_prefix}BODY_SIZE_LIMIT`
-	);
-	const raw_idle_timeout = Number(read_env('IDLE_TIMEOUT', '10'));
-	if (!Number.isFinite(raw_idle_timeout) || raw_idle_timeout < 0) {
-		throw new Error(`${env_prefix}IDLE_TIMEOUT must be a non-negative number`);
-	}
-	// Bun.serve clamps at BUN_MAX_IDLE_TIMEOUT_S; apply ceiling to avoid a runtime error.
-	const idle_timeout = Math.min(BUN_MAX_IDLE_TIMEOUT_S, raw_idle_timeout);
-	const shutdown_timeout = Number(read_env('SHUTDOWN_TIMEOUT', '30'));
-	if (!Number.isFinite(shutdown_timeout) || shutdown_timeout < 0) {
-		throw new Error(`${env_prefix}SHUTDOWN_TIMEOUT must be a non-negative number`);
-	}
+	// Only hashed build output gets the immutable cache header — not e.g. version.json.
+	const immutable_prefix = `/${manifest.appPath}/immutable/`;
 
 	// Prerendered overrides client on key overlap.
 	/** @type {Record<string, (request: Request) => Response>} */
 	const routes = {};
-	for (const [url_path, bunfs_path] of Object.entries({
-		...client_assets,
-		...prerendered_assets
-	})) {
-		routes[url_path] = make_asset_handler(bunfs_path);
+	for (const [url_path, bunfs_path] of Object.entries(client_assets)) {
+		routes[url_path] = make_asset_handler(bunfs_path, {
+			type: mime_type(url_path, manifest.mimeTypes),
+			cache_control: url_path.startsWith(immutable_prefix) ? IMMUTABLE_CACHE_CONTROL : undefined
+		});
+	}
+	for (const [url_path, bunfs_path] of Object.entries(prerendered_assets)) {
+		routes[url_path] = make_asset_handler(bunfs_path, {
+			type: mime_type(url_path, manifest.mimeTypes)
+		});
 	}
 
 	const bun_server = Bun.serve({
@@ -88,13 +237,13 @@ export async function start({
 		port,
 		routes,
 		maxRequestBodySize: body_size_limit,
-		idleTimeout: idle_timeout,
+		idleTimeout: connection_idle_timeout,
 		fetch: async (request, srv) => {
 			try {
 				const url = new URL(request.url);
 
 				const effective_origin = resolve_origin(request, url, {
-					origin_env,
+					origin,
 					protocol_header,
 					host_header,
 					port_header
@@ -117,18 +266,36 @@ export async function start({
 				}
 
 				if (!prerendered.has(pathname)) {
-					let location = pathname.at(-1) === '/' ? pathname.slice(0, -1) : pathname + '/';
-					if (prerendered.has(location)) {
-						if (final_url.search) location += final_url.search;
+					// remove or add trailing slash as appropriate
+					const inverted = pathname.at(-1) === '/' ? pathname.slice(0, -1) : pathname + '/';
+					if (prerendered.has(inverted)) {
+						// a *relative* location survives a proxy that strips a mount prefix
+						const location = relative_pathname(pathname, inverted) + final_url.search;
 						return new Response(null, { status: 308, headers: { location } });
 					}
 				}
 
-				return await server.respond(final_request, {
+				const response = await server.respond(final_request, {
 					platform: { server: srv },
 					getClientAddress: () =>
 						get_client_address(request, srv, address_header, xff_depth, env_prefix)
 				});
+
+				// Reverse proxies such as nginx buffer responses by default (ignoring
+				// `cache-control`), which breaks streaming responses like server-sent events.
+				// `X-Accel-Buffering: no` opts out of that buffering and is a no-op on proxies
+				// that don't recognise it. See https://github.com/sveltejs/kit/issues/15790
+				if (response.headers.get('content-type') === 'text/event-stream') {
+					response.headers.set('x-accel-buffering', 'no');
+
+					// A server-sent-events stream may stay quiet for longer than
+					// `CONNECTION_IDLE_TIMEOUT` (SvelteKit's `query.live`, for instance,
+					// only sends a keep-alive comment every 30s), which would have Bun
+					// close the connection mid-response. Opt this connection out.
+					if (connection_idle_timeout > 0) srv.timeout(request, 0);
+				}
+
+				return response;
 			} catch (err) {
 				process.stderr.write(
 					`adapter-bun: unhandled error for ${request.method} ${request.url}: ${
@@ -173,37 +340,13 @@ export async function start({
 }
 
 /**
- * @param {string | undefined} value
- * @param {string} env_name
- * @returns {string | undefined}
- */
-export function parse_origin(value, env_name) {
-	if (value === undefined) return undefined;
-
-	const trimmed = value.trim();
-	let url;
-	try {
-		url = new URL(trimmed);
-	} catch (cause) {
-		throw new Error(
-			`Invalid ${env_name}: '${trimmed}'. Must be a valid URL with http:// or https:// protocol. ` +
-				`For example: 'http://localhost:3000'`,
-			{ cause }
-		);
-	}
-	if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-		throw new Error(`Invalid ${env_name}: '${trimmed}'. Only http:// and https:// are supported.`);
-	}
-	return url.origin;
-}
-
-/**
- * Resolve the origin the browser is seeing, honoring env-configured proxy headers.
+ * Resolve the origin the browser is seeing: the build-time `kit.paths.origin` if
+ * configured, otherwise derived from the request and env-configured proxy headers.
  *
  * @param {Request} request
  * @param {URL} url
  * @param {Object} cfg
- * @param {string} [cfg.origin_env]
+ * @param {string} [cfg.origin]          `kit.paths.origin`, baked in at build time
  * @param {string} cfg.protocol_header   lowercased, '' to disable
  * @param {string} cfg.host_header       lowercased, '' to disable
  * @param {string} cfg.port_header       lowercased, '' to disable
@@ -212,9 +355,9 @@ export function parse_origin(value, env_name) {
 export function resolve_origin(
 	request,
 	url,
-	{ origin_env, protocol_header, host_header, port_header }
+	{ origin, protocol_header, host_header, port_header }
 ) {
-	if (origin_env) return origin_env;
+	if (origin) return origin;
 	if (!protocol_header && !host_header && !port_header) return undefined;
 
 	const headers = request.headers;
@@ -249,6 +392,42 @@ export function resolve_origin(
 	}
 
 	return port ? `${protocol}://${hostname}:${port}` : `${protocol}://${hostname}`;
+}
+
+/**
+ * Content type for a served asset, taken from SvelteKit's manifest metadata so that
+ * types SvelteKit knows about (e.g. `.ico`, `image/jxl`) are used rather than only
+ * Bun's own extension mapping. Returns `undefined` when the manifest has no entry,
+ * in which case `Bun.file(...).type` is used as the fallback.
+ *
+ * @param {string} url_path
+ * @param {Record<string, string> | undefined} mime_types  `manifest.mimeTypes`
+ * @returns {string | undefined}
+ */
+export function mime_type(url_path, mime_types) {
+	const filename = url_path.slice(url_path.lastIndexOf('/') + 1);
+	const dot = filename.lastIndexOf('.');
+	if (dot === -1) return undefined;
+
+	const type = mime_types?.[filename.slice(dot)];
+	if (!type) return undefined;
+
+	return type === 'text/html' ? 'text/html;charset=utf-8' : type;
+}
+
+/**
+ * Relative reference from `from` to `to`, which must differ only by a trailing slash.
+ * Mirrors adapter-node's helper so slash redirects keep working behind a proxy that
+ * strips a mount prefix.
+ *
+ * @param {string} from
+ * @param {string} to
+ * @returns {string}
+ */
+export function relative_pathname(from, to) {
+	const segment = to.replace(/\/$/, '').split('/').at(-1);
+
+	return from.endsWith('/') ? `../${segment}` : `${segment}/`;
 }
 
 /**
@@ -309,12 +488,17 @@ export function parse_as_bytes(value, env_name) {
  * Per-asset handler: GET, HEAD, OPTIONS, plus `Range: bytes=start-end` (206). Other methods → 405.
  *
  * @param {string} bunfs_path
+ * @param {Object} [options]
+ * @param {string} [options.type]           content type; defaults to Bun's extension mapping
+ * @param {string} [options.cache_control]  `cache-control` header, if any
  * @returns {(request: Request) => Response}
  */
-export function make_asset_handler(bunfs_path) {
+export function make_asset_handler(bunfs_path, { type: mime, cache_control } = {}) {
 	const file = Bun.file(bunfs_path);
-	const type = file.type;
+	const type = mime ?? file.type;
 	const size = file.size;
+	/** @type {Record<string, string>} */
+	const extra_headers = cache_control ? { 'cache-control': cache_control } : {};
 
 	return (request) => {
 		const method = request.method;
@@ -344,6 +528,7 @@ export function make_asset_handler(bunfs_path) {
 					return new Response(body, {
 						status: 206,
 						headers: {
+							...extra_headers,
 							'content-type': type,
 							'content-range': `bytes ${start}-${end}/${size}`,
 							'content-length': String(end - start + 1),
@@ -361,6 +546,7 @@ export function make_asset_handler(bunfs_path) {
 		const body = method === 'HEAD' ? null : file;
 		return new Response(body, {
 			headers: {
+				...extra_headers,
 				'content-type': type,
 				'content-length': String(size),
 				'accept-ranges': 'bytes'

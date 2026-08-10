@@ -26,8 +26,14 @@ interface AdapterOptions {
 	binaryName?: string;
 
 	/**
-	 * Prefix for SvelteKit-specific environment variables. Useful when running
-	 * alongside other processes that use conflicting variable names.
+	 * Prefix for the runtime environment variables (`HOST`, `PORT`,
+	 * `CONNECTION_IDLE_TIMEOUT`, …). Useful when running alongside other
+	 * processes that use conflicting variable names.
+	 *
+	 * When set, the built app refuses to start if any *other* variable carries
+	 * the prefix — that normally means the prefix collides with something else
+	 * in the environment. See the README for the full list of supported
+	 * variables.
 	 * @default ''
 	 */
 	envPrefix?: string;

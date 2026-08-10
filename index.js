@@ -1,3 +1,4 @@
+import { mkdirSync, rmSync } from 'node:fs';
 import { basename } from 'node:path';
 import { generate_entry } from './src/codegen.js';
 import { apply_windows_branding } from './src/windows-brand.js';
@@ -43,9 +44,9 @@ export default function plugin(opts = {}) {
 			}
 
 			const tmp = builder.getBuildDirectory('adapter-bun');
-			builder.rimraf(out);
-			builder.rimraf(tmp);
-			builder.mkdirp(tmp);
+			rmSync(out, { force: true, recursive: true });
+			rmSync(tmp, { force: true, recursive: true });
+			mkdirSync(tmp, { recursive: true });
 
 			const base = builder.config.kit.paths.base;
 
@@ -109,10 +110,29 @@ export default function plugin(opts = {}) {
 				client_assets,
 				prerendered_assets,
 				server_assets,
+				// `kit.paths.origin` is baked in at build time (Kit validates and
+				// normalizes it); when unset the runtime derives the origin from the
+				// request and any configured proxy headers.
+				origin: builder.config.kit.paths.origin,
 				env_prefix: envPrefix
 			});
 
 			await Bun.write(`${out}/entry.js`, entry_source);
+
+			// `writeServer` already copied `instrumentation.server.js` into `${out}/server`,
+			// so all that's left is to turn `entry.js` into a facade that imports it before
+			// dynamically importing the real entry (renamed to `start.js`). Bun.build then
+			// compiles the facade, embedding both graphs in the executable.
+			if (builder.hasServerInstrumentationFile()) {
+				builder.log.minor('Instrumenting entry point');
+				builder.instrument({
+					entrypoint: `${out}/entry.js`,
+					instrumentation: `${out}/server/instrumentation.server.js`,
+					// the generated entry is a side-effect-only script (`await start({...})`),
+					// so there is nothing to re-export from the renamed module
+					module: { exports: [] }
+				});
+			}
 
 			if (!compile) {
 				builder.log.minor(`Skipping executable compile; run with \`bun run ${out}/entry.js\``);
@@ -245,7 +265,8 @@ export default function plugin(opts = {}) {
 		},
 
 		supports: {
-			read: () => true
+			read: () => true,
+			instrumentation: () => true
 		}
 	};
 }
