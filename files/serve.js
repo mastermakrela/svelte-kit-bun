@@ -6,23 +6,34 @@ const BUN_MAX_IDLE_TIMEOUT_S = 255;
 const XFF = 'x-forwarded-for';
 
 /**
- * Environment variables the runtime reads, without the `envPrefix`. When an
- * `envPrefix` is configured, any *other* prefixed variable is a configuration
- * mistake and `validate_env` throws — same contract as adapter-node's `env.js`.
+ * Environment variables the runtime reads (without the `envPrefix`), mapped to
+ * their defaults.
  */
-export const SUPPORTED_ENV_VARS = new Set([
-	'HOST',
-	'PORT',
-	'SOCKET_PATH',
-	'XFF_DEPTH',
-	'ADDRESS_HEADER',
-	'PROTOCOL_HEADER',
-	'HOST_HEADER',
-	'PORT_HEADER',
-	'BODY_SIZE_LIMIT',
-	'SHUTDOWN_TIMEOUT',
-	'CONNECTION_IDLE_TIMEOUT'
-]);
+const ENV_DEFAULTS = {
+	HOST: '0.0.0.0',
+	PORT: '3000',
+	// when set, `start()` binds to this unix socket instead of host/port
+	SOCKET_PATH: '',
+	XFF_DEPTH: '1',
+	ADDRESS_HEADER: '',
+	PROTOCOL_HEADER: '',
+	HOST_HEADER: '',
+	PORT_HEADER: '',
+	BODY_SIZE_LIMIT: '512K',
+	SHUTDOWN_TIMEOUT: '30',
+	// Bun.serve's own default is 10s, which closes any connection that goes
+	// quiet for 10s — including an in-flight request whose handler hasn't
+	// written bytes yet, and a slow server-sent-events stream. Default to `0`
+	// (no timeout) so quiet long-lived responses are never cut off silently.
+	CONNECTION_IDLE_TIMEOUT: '0'
+};
+
+/**
+ * When an `envPrefix` is configured, any prefixed variable not in this set is a
+ * configuration mistake and `validate_env` throws — same contract as
+ * adapter-node's `env.js`.
+ */
+export const SUPPORTED_ENV_VARS = new Set(Object.keys(ENV_DEFAULTS));
 
 /**
  * adapter-node variables that have no counterpart here, mapped to the reason.
@@ -96,49 +107,37 @@ export function read_config(
 	validate_env(env, env_prefix, warn);
 
 	/**
-	 * @param {string} name
-	 * @param {string} fallback
+	 * @param {keyof typeof ENV_DEFAULTS} name
 	 * @returns {string}
 	 */
-	const read_env = (name, fallback) => env[`${env_prefix}${name}`] ?? fallback;
+	const read_env = (name) => env[`${env_prefix}${name}`] ?? ENV_DEFAULTS[name];
 
-	const port = Number(read_env('PORT', '3000'));
+	const port = Number(read_env('PORT'));
 	if (!Number.isInteger(port) || port < 0 || port > 65535) {
 		throw new Error(`${env_prefix}PORT must be an integer between 0 and 65535`);
 	}
 
-	const xff_depth = Number(read_env('XFF_DEPTH', '1'));
+	const xff_depth = Number(read_env('XFF_DEPTH'));
 	if (!Number.isInteger(xff_depth) || xff_depth < 1) {
 		throw new Error(`${env_prefix}XFF_DEPTH must be a positive integer`);
 	}
 
 	return {
-		host: read_env('HOST', '0.0.0.0'),
+		host: read_env('HOST'),
 		port,
-		// when set, `start()` binds to this unix socket instead of host/port
-		socket_path: read_env('SOCKET_PATH', ''),
+		socket_path: read_env('SOCKET_PATH'),
 		xff_depth,
-		address_header: read_env('ADDRESS_HEADER', '').toLowerCase(),
-		protocol_header: read_env('PROTOCOL_HEADER', '').toLowerCase(),
-		host_header: read_env('HOST_HEADER', '').toLowerCase(),
-		port_header: read_env('PORT_HEADER', '').toLowerCase(),
-		body_size_limit: parse_as_bytes(
-			read_env('BODY_SIZE_LIMIT', '512K'),
-			`${env_prefix}BODY_SIZE_LIMIT`
-		),
-		// Bun.serve's own default is 10s, which closes any connection that goes
-		// quiet for 10s — including an in-flight request whose handler hasn't
-		// written bytes yet, and a slow server-sent-events stream. Default to `0`
-		// (no timeout) so quiet long-lived responses are never cut off silently.
+		address_header: read_env('ADDRESS_HEADER').toLowerCase(),
+		protocol_header: read_env('PROTOCOL_HEADER').toLowerCase(),
+		host_header: read_env('HOST_HEADER').toLowerCase(),
+		port_header: read_env('PORT_HEADER').toLowerCase(),
+		body_size_limit: parse_as_bytes(read_env('BODY_SIZE_LIMIT'), `${env_prefix}BODY_SIZE_LIMIT`),
 		connection_idle_timeout: parse_timeout(
-			read_env('CONNECTION_IDLE_TIMEOUT', '0'),
+			read_env('CONNECTION_IDLE_TIMEOUT'),
 			`${env_prefix}CONNECTION_IDLE_TIMEOUT`,
 			BUN_MAX_IDLE_TIMEOUT_S
 		),
-		shutdown_timeout: parse_timeout(
-			read_env('SHUTDOWN_TIMEOUT', '30'),
-			`${env_prefix}SHUTDOWN_TIMEOUT`
-		)
+		shutdown_timeout: parse_timeout(read_env('SHUTDOWN_TIMEOUT'), `${env_prefix}SHUTDOWN_TIMEOUT`)
 	};
 }
 

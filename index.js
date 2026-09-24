@@ -137,17 +137,21 @@ export default function plugin(opts = {}) {
 			// one shared buffer for every `measure()` call below, mirroring upstream's `measure_files`
 			const hash_buffer = Buffer.allocUnsafe(64 * 1024);
 
-			// `builder.compress` returns paths relative to the directory it compressed, matching
-			// `rel` below one-for-one — when present there, both `.br` and `.gz` siblings exist.
 			/**
-			 * @param {string} rel
-			 * @param {string} path - on-disk path to the uncompressed file (same as passed to `measure`)
-			 * @param {string} import_path - import path to the uncompressed file
+			 * @param {'client' | 'prerendered'} kind - output subdirectory under `out`
+			 * @param {string} rel - path relative to `${out}/${kind}${base}`, as returned by `builder.compress`
+			 * @param {string} key - URL path the asset is served at
 			 * @param {Set<string>} compressed_set
+			 * @returns {import('./src/codegen.js').AssetEntry}
 			 */
-			function compressed_variants(rel, path, import_path, compressed_set) {
-				if (!compressed_set.has(rel)) return {};
+			function asset_entry(kind, rel, key, compressed_set) {
+				const path = `${out}/${kind}${base}/${rel}`;
+				const import_path = `./${kind}/${base_segment}${rel}`;
+				const entry = { import_path, key, ...measure(path, hash_buffer) };
+				// when present in `compressed_set`, both `.br` and `.gz` siblings exist
+				if (!compressed_set.has(rel)) return entry;
 				return {
+					...entry,
 					br: { import_path: `${import_path}.br`, size: statSync(`${path}.br`).size },
 					gz: { import_path: `${import_path}.gz`, size: statSync(`${path}.gz`).size }
 				};
@@ -155,53 +159,24 @@ export default function plugin(opts = {}) {
 
 			// Dotfiles are skipped before they're even imported into entry.js, so they
 			// never end up embedded in the executable.
-			/** @type {import('./src/codegen.js').AssetEntry[]} */
 			const client_assets = client_files
 				.filter((rel) => !is_hidden(rel))
-				.map((rel) => {
-					const path = `${client_dir}/${rel}`;
-					const { size, etag } = measure(path, hash_buffer);
-					const import_path = `./client/${base_segment}${rel}`;
-					return {
-						import_path,
-						key: `/${base_segment}${rel}`,
-						size,
-						etag,
-						...compressed_variants(rel, path, import_path, client_compressed_set)
-					};
-				});
+				.map((rel) => asset_entry('client', rel, `/${base_segment}${rel}`, client_compressed_set));
 
-			// Prerendered pages: URL key may differ from on-disk filename
-			// (e.g. `/foo` → `foo.html`), so use builder.prerendered.pages as source of truth.
-			/** @type {import('./src/codegen.js').AssetEntry[]} */
-			const prerendered_assets = [];
-			for (const [url_path, { file }] of builder.prerendered.pages) {
-				const path = `${prerendered_dir}/${file}`;
-				const { size, etag } = measure(path, hash_buffer);
-				const import_path = `./prerendered/${base_segment}${file}`;
-				prerendered_assets.push({
-					import_path,
-					key: url_path,
-					size,
-					etag,
-					...compressed_variants(file, path, import_path, prerendered_compressed_set)
-				});
-			}
-			// Non-HTML prerendered assets: URL path mirrors the on-disk layout.
-			for (const [url_path] of builder.prerendered.assets) {
-				const rel = url_path.slice(base.length + 1);
-				if (is_hidden(rel)) continue;
-				const path = `${out}/prerendered${url_path}`;
-				const { size, etag } = measure(path, hash_buffer);
-				const import_path = `./prerendered${url_path}`;
-				prerendered_assets.push({
-					import_path,
-					key: url_path,
-					size,
-					etag,
-					...compressed_variants(rel, path, import_path, prerendered_compressed_set)
-				});
-			}
+			const prerendered_assets = [
+				// Prerendered pages: URL key may differ from on-disk filename
+				// (e.g. `/foo` → `foo.html`), so use builder.prerendered.pages as source of truth.
+				...Array.from(builder.prerendered.pages, ([url_path, { file }]) =>
+					asset_entry('prerendered', file, url_path, prerendered_compressed_set)
+				),
+				// Non-HTML prerendered assets: URL path mirrors the on-disk layout.
+				...Array.from(builder.prerendered.assets.keys()).flatMap((url_path) => {
+					const rel = url_path.slice(base.length + 1);
+					return is_hidden(rel)
+						? []
+						: [asset_entry('prerendered', rel, url_path, prerendered_compressed_set)];
+				})
+			];
 
 			// `name` is already relative to the server output dir (e.g.
 			// `_app/immutable/assets/greeting.hash.txt`).

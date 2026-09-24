@@ -1040,15 +1040,19 @@ describe('etag_matches', () => {
 	});
 });
 
+/** `size` is derived from the bunfs path so a response identifies which file its handler was built from. */
+function built_asset(file: string) {
+	return { file, size: file.length, etag: file };
+}
+
 describe('create_file_map', () => {
-	const asset = (file: string) => ({ file, size: file.length, etag: file });
 	const base_opts = { app_path: '_app', mime_types: { '.html': 'text/html' } };
 
 	test('client assets win a key collision over prerendered assets', () => {
 		const files = create_file_map({
 			...base_opts,
-			client_assets: { '/overlap': asset('/bunfs/client') },
-			prerendered_assets: { '/overlap': asset('/bunfs/prerendered') }
+			client_assets: { '/overlap': built_asset('/bunfs/client') },
+			prerendered_assets: { '/overlap': built_asset('/bunfs/prerendered') }
 		});
 
 		expect(files.get('/overlap')?.file).toBe('/bunfs/client');
@@ -1057,7 +1061,7 @@ describe('create_file_map', () => {
 	test('`/foo` and `/foo/` alias to `foo.html`', () => {
 		const files = create_file_map({
 			...base_opts,
-			client_assets: { '/docs.html': asset('/bunfs/docs.html') },
+			client_assets: { '/docs.html': built_asset('/bunfs/docs.html') },
 			prerendered_assets: {}
 		});
 
@@ -1069,7 +1073,7 @@ describe('create_file_map', () => {
 	test('`/foo` and `/foo/` alias to `foo/index.html` when only that exists', () => {
 		const files = create_file_map({
 			...base_opts,
-			client_assets: { '/guide/index.html': asset('/bunfs/guide/index.html') },
+			client_assets: { '/guide/index.html': built_asset('/bunfs/guide/index.html') },
 			prerendered_assets: {}
 		});
 
@@ -1081,8 +1085,8 @@ describe('create_file_map', () => {
 		const files = create_file_map({
 			...base_opts,
 			client_assets: {
-				'/both.html': asset('/bunfs/both.html'),
-				'/both/index.html': asset('/bunfs/both/index.html')
+				'/both.html': built_asset('/bunfs/both.html'),
+				'/both/index.html': built_asset('/bunfs/both/index.html')
 			},
 			prerendered_assets: {}
 		});
@@ -1094,8 +1098,8 @@ describe('create_file_map', () => {
 		const files = create_file_map({
 			...base_opts,
 			client_assets: {
-				'/docs.html': asset('/bunfs/docs.html'),
-				'/docs': asset('/bunfs/docs-real')
+				'/docs.html': built_asset('/bunfs/docs.html'),
+				'/docs': built_asset('/bunfs/docs-real')
 			},
 			prerendered_assets: {}
 		});
@@ -1106,7 +1110,7 @@ describe('create_file_map', () => {
 	test('a root-level index.html does not alias to an empty-string key', () => {
 		const files = create_file_map({
 			...base_opts,
-			client_assets: { '/index.html': asset('/bunfs/index.html') },
+			client_assets: { '/index.html': built_asset('/bunfs/index.html') },
 			prerendered_assets: {}
 		});
 
@@ -1118,7 +1122,7 @@ describe('create_file_map', () => {
 		const files = create_file_map({
 			...base_opts,
 			client_assets: {},
-			prerendered_assets: { '/about.html': asset('/bunfs/about.html') }
+			prerendered_assets: { '/about.html': built_asset('/bunfs/about.html') }
 		});
 
 		expect(files.has('/about')).toBe(false);
@@ -1129,7 +1133,7 @@ describe('create_file_map', () => {
 		const files = create_file_map({
 			app_path: '_app',
 			mime_types: {},
-			client_assets: { '/_app/immutable/chunks/a.js': asset('/bunfs/a.js') },
+			client_assets: { '/_app/immutable/chunks/a.js': built_asset('/bunfs/a.js') },
 			prerendered_assets: {}
 		});
 
@@ -1165,11 +1169,6 @@ describe('start', () => {
 		/** The `start()` promise itself, so a test can trigger a signal and await shutdown. */
 		started: Promise<unknown>;
 		dispose: () => void;
-	}
-
-	/** `size` is derived from the bunfs path so a response identifies which file its handler was built from. */
-	function built_asset(file: string) {
-		return { file, size: file.length, etag: file };
 	}
 
 	async function start_runtime({
