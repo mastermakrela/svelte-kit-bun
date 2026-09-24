@@ -30,12 +30,14 @@ function assert_adapter_is_current() {
 export interface BuildOptions {
 	/** Adapter `out` directory, relative to the fixture root. @default 'build' */
 	out?: string;
-	/** Value for `kit.paths.origin`. Left unset when omitted. */
+	/** Value for `paths.origin`. Left unset when omitted. */
 	origin?: string;
-	/** Value for `kit.paths.base`. @default '' */
+	/** Value for `paths.base`. @default '' */
 	base?: string;
 	/** Adapter `compile` option. @default true */
 	compile?: boolean;
+	/** Adapter `precompress` option. @default true */
+	precompress?: boolean;
 	/** Adapter `envPrefix` option. @default '' */
 	env_prefix?: string;
 	/**
@@ -54,6 +56,7 @@ export function build_fixture({
 	origin,
 	base = '',
 	compile = true,
+	precompress = true,
 	env_prefix = '',
 	instrumentation = false
 }: BuildOptions = {}): string {
@@ -77,6 +80,7 @@ export function build_fixture({
 				...process.env,
 				ADAPTER_BUN_OUT: out,
 				ADAPTER_BUN_COMPILE: String(compile),
+				ADAPTER_BUN_PRECOMPRESS: String(precompress),
 				ADAPTER_BUN_ENV_PREFIX: env_prefix,
 				ADAPTER_BUN_BASE: base,
 				...(origin ? { ADAPTER_BUN_ORIGIN: origin } : {})

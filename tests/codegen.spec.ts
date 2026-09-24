@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import { generate_entry } from '../src/codegen.js';
 
 const defaults = {
-	server_index_path: './server/index.js',
+	server_path: './server/server.js',
 	manifest_path: './server/manifest.js',
 	serve_path: './serve.js'
 };
@@ -12,17 +12,45 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/favicon.png', key: '/favicon.png' },
+				{
+					import_path: './client/favicon.png',
+					key: '/favicon.png',
+					size: 1234,
+					etag: 'etag-favicon'
+				},
 				{
 					import_path: './client/_app/immutable/chunks/abc.js',
-					key: '/_app/immutable/chunks/abc.js'
+					key: '/_app/immutable/chunks/abc.js',
+					size: 42,
+					etag: 'etag-abc'
 				}
 			],
-			prerendered_assets: [{ import_path: './prerendered/about.html', key: '/about' }],
+			prerendered_assets: [
+				{ import_path: './prerendered/about.html', key: '/about', size: 99, etag: 'etag-about' }
+			],
 			server_assets: [{ import_path: './server/_app/immutable/assets/data.bin', key: 'data.bin' }]
 		});
 
 		expect(output).toMatchSnapshot();
+	});
+
+	test('client/prerendered map entries carry build-time size/etag; server assets stay plain identifiers', () => {
+		const output = generate_entry({
+			...defaults,
+			client_assets: [{ import_path: './client/a.png', key: '/a.png', size: 10, etag: 'etag-a' }],
+			prerendered_assets: [
+				{ import_path: './prerendered/about.html', key: '/about', size: 20, etag: 'etag-about' }
+			],
+			server_assets: [{ import_path: './server/x.bin', key: 'x.bin' }]
+		});
+
+		expect(output).toContain(
+			'const client_assets = {\n\t"/a.png": { file: _client_0, size: 10, etag: "etag-a" }\n};'
+		);
+		expect(output).toContain(
+			'const prerendered_assets = {\n\t"/about": { file: _prerendered_0, size: 20, etag: "etag-about" }\n};'
+		);
+		expect(output).toContain('const server_assets = {\n\t"x.bin": _server_0\n};');
 	});
 
 	test('empty asset arrays produce empty object literals', () => {
@@ -44,8 +72,10 @@ describe('generate_entry', () => {
 		// no stray asset-import lines were emitted
 		expect(output).not.toContain("with { type: 'file' }");
 
-		expect(output).toContain('import { Server } from "./server/index.js";');
-		expect(output).toContain('import { manifest, prerendered } from "./server/manifest.js";');
+		expect(output).toContain('import { server } from "./server/server.js";');
+		expect(output).toContain(
+			'import { prerendered, app_path, mime_types } from "./server/manifest.js";'
+		);
 		expect(output).toContain('import { start } from "./serve.js";');
 		expect(output).toContain('await start({');
 
@@ -56,13 +86,15 @@ describe('generate_entry', () => {
 	test('only one category populated: client only', () => {
 		const output = generate_entry({
 			...defaults,
-			client_assets: [{ import_path: './client/a.js', key: '/a.js' }],
+			client_assets: [{ import_path: './client/a.js', key: '/a.js', size: 10, etag: 'etag-a' }],
 			prerendered_assets: [],
 			server_assets: []
 		});
 
 		expect(output).toContain('import _client_0 from "./client/a.js" with { type: \'file\' };');
-		expect(output).toContain('const client_assets = {\n\t"/a.js": _client_0\n};');
+		expect(output).toContain(
+			'const client_assets = {\n\t"/a.js": { file: _client_0, size: 10, etag: "etag-a" }\n};'
+		);
 		expect(output).toContain('const prerendered_assets = {};');
 		expect(output).toContain('const server_assets = {};');
 		expect(output).not.toMatch(/,\s*\}/);
@@ -128,10 +160,25 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/with space.png', key: '/with space.png' },
-				{ import_path: './client/quote".js', key: '/quote".js' },
-				{ import_path: './client/emoji-\u{1F525}.txt', key: '/emoji-\u{1F525}.txt' },
-				{ import_path: './client/slash/nested/file.js', key: '/slash/nested/file.js' }
+				{
+					import_path: './client/with space.png',
+					key: '/with space.png',
+					size: 1,
+					etag: 'e1'
+				},
+				{ import_path: './client/quote".js', key: '/quote".js', size: 2, etag: 'e2' },
+				{
+					import_path: './client/emoji-\u{1F525}.txt',
+					key: '/emoji-\u{1F525}.txt',
+					size: 3,
+					etag: 'e3'
+				},
+				{
+					import_path: './client/slash/nested/file.js',
+					key: '/slash/nested/file.js',
+					size: 4,
+					etag: 'e4'
+				}
 			],
 			prerendered_assets: [],
 			server_assets: []
@@ -155,10 +202,12 @@ describe('generate_entry', () => {
 		const input = {
 			...defaults,
 			client_assets: [
-				{ import_path: './client/a.png', key: '/a.png' },
-				{ import_path: './client/b.png', key: '/b.png' }
+				{ import_path: './client/a.png', key: '/a.png', size: 1, etag: 'ea' },
+				{ import_path: './client/b.png', key: '/b.png', size: 2, etag: 'eb' }
 			],
-			prerendered_assets: [{ import_path: './prerendered/index.html', key: '/' }],
+			prerendered_assets: [
+				{ import_path: './prerendered/index.html', key: '/', size: 3, etag: 'ei' }
+			],
 			server_assets: [{ import_path: './server/x.bin', key: 'x.bin' }]
 		};
 
@@ -172,13 +221,13 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/0.js', key: '/0.js' },
-				{ import_path: './client/1.js', key: '/1.js' },
-				{ import_path: './client/2.js', key: '/2.js' }
+				{ import_path: './client/0.js', key: '/0.js', size: 1, etag: 'e0' },
+				{ import_path: './client/1.js', key: '/1.js', size: 1, etag: 'e1' },
+				{ import_path: './client/2.js', key: '/2.js', size: 1, etag: 'e2' }
 			],
 			prerendered_assets: [
-				{ import_path: './prerendered/a.html', key: '/a' },
-				{ import_path: './prerendered/b.html', key: '/b' }
+				{ import_path: './prerendered/a.html', key: '/a', size: 1, etag: 'ea' },
+				{ import_path: './prerendered/b.html', key: '/b', size: 1, etag: 'eb' }
 			],
 			server_assets: [{ import_path: './server/s.bin', key: 's.bin' }]
 		});
@@ -200,9 +249,9 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/z.js', key: '/z.js' },
-				{ import_path: './client/a.js', key: '/a.js' },
-				{ import_path: './client/m.js', key: '/m.js' }
+				{ import_path: './client/z.js', key: '/z.js', size: 1, etag: 'ez' },
+				{ import_path: './client/a.js', key: '/a.js', size: 1, etag: 'ea' },
+				{ import_path: './client/m.js', key: '/m.js', size: 1, etag: 'em' }
 			],
 			prerendered_assets: [],
 			server_assets: []
@@ -220,13 +269,13 @@ describe('generate_entry', () => {
 	test('imports are ordered: fixed first, then client, prerendered, server', () => {
 		const output = generate_entry({
 			...defaults,
-			client_assets: [{ import_path: './client/c.js', key: '/c.js' }],
-			prerendered_assets: [{ import_path: './prerendered/p.html', key: '/p' }],
+			client_assets: [{ import_path: './client/c.js', key: '/c.js', size: 1, etag: 'ec' }],
+			prerendered_assets: [{ import_path: './prerendered/p.html', key: '/p', size: 1, etag: 'ep' }],
 			server_assets: [{ import_path: './server/s.bin', key: 's.bin' }]
 		});
 
-		const server_fixed = output.indexOf('import { Server }');
-		const manifest_fixed = output.indexOf('import { manifest');
+		const server_fixed = output.indexOf('import { server }');
+		const manifest_fixed = output.indexOf('import { prerendered');
 		const start_fixed = output.indexOf('import { start }');
 		const client_import = output.indexOf('_client_0');
 		const prerendered_import = output.indexOf('_prerendered_0');
@@ -240,9 +289,85 @@ describe('generate_entry', () => {
 		expect(server_asset_import).toBeGreaterThan(prerendered_import);
 	});
 
+	test('precompressed variants: snapshot', () => {
+		const output = generate_entry({
+			...defaults,
+			client_assets: [
+				{
+					import_path: './client/app.js',
+					key: '/app.js',
+					size: 100,
+					etag: 'etag-app',
+					br: { import_path: './client/app.js.br', size: 40 },
+					gz: { import_path: './client/app.js.gz', size: 60 }
+				}
+			],
+			prerendered_assets: [
+				{
+					import_path: './prerendered/about.html',
+					key: '/about',
+					size: 200,
+					etag: 'etag-about',
+					br: { import_path: './prerendered/about.html.br', size: 80 },
+					gz: { import_path: './prerendered/about.html.gz', size: 120 }
+				}
+			],
+			server_assets: []
+		});
+
+		expect(output).toMatchSnapshot();
+	});
+
+	test('precompress: false (no br/gz on entries) omits variant imports and fields', () => {
+		const output = generate_entry({
+			...defaults,
+			client_assets: [
+				{ import_path: './client/app.js', key: '/app.js', size: 100, etag: 'etag-app' }
+			],
+			prerendered_assets: [],
+			server_assets: []
+		});
+
+		expect(output).not.toContain('_client_0_br');
+		expect(output).not.toContain('_client_0_gz');
+		expect(output).not.toContain('.br"');
+		expect(output).not.toContain('.gz"');
+		expect(output).toContain(
+			'const client_assets = {\n\t"/app.js": { file: _client_0, size: 100, etag: "etag-app" }\n};'
+		);
+	});
+
+	test('a variant on only one asset only emits imports/fields for that asset', () => {
+		const output = generate_entry({
+			...defaults,
+			client_assets: [
+				{ import_path: './client/a.js', key: '/a.js', size: 1, etag: 'ea' },
+				{
+					import_path: './client/b.png',
+					key: '/b.png',
+					size: 2,
+					etag: 'eb',
+					gz: { import_path: './client/b.png.gz', size: 1 }
+				}
+			],
+			prerendered_assets: [],
+			server_assets: []
+		});
+
+		expect(output).not.toContain('_client_0_gz');
+		expect(output).not.toContain('_client_0_br');
+		expect(output).toContain(
+			'import _client_1_gz from "./client/b.png.gz" with { type: \'file\' };'
+		);
+		expect(output).not.toContain('_client_1_br');
+		expect(output).toContain(
+			'"/b.png": { file: _client_1, size: 2, etag: "eb", gz: { file: _client_1_gz, size: 1 } }'
+		);
+	});
+
 	test('custom import paths are used verbatim (no normalization)', () => {
 		const output = generate_entry({
-			server_index_path: '../weird/server.mjs',
+			server_path: '../weird/server.mjs',
 			manifest_path: './nested/m.js',
 			serve_path: './serve.mjs',
 			client_assets: [],
@@ -250,8 +375,8 @@ describe('generate_entry', () => {
 			server_assets: []
 		});
 
-		expect(output).toContain('import { Server } from "../weird/server.mjs";');
-		expect(output).toContain('import { manifest, prerendered } from "./nested/m.js";');
+		expect(output).toContain('import { server } from "../weird/server.mjs";');
+		expect(output).toContain('import { prerendered, app_path, mime_types } from "./nested/m.js";');
 		expect(output).toContain('import { start } from "./serve.mjs";');
 	});
 });

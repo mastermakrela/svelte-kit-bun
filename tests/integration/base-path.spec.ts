@@ -1,23 +1,27 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { build_fixture, start_app, stop_app, type SpawnedServer } from '../helpers/fixture.js';
 
 /**
  * Every response rule the adapter applies keys off a path that contains
- * `kit.paths.base`: the immutable cache header is derived from `manifest.appPath`
+ * `paths.base`: the immutable cache header is derived from `builder.getAppPath()`
  * (which SvelteKit builds as `<base>/<appDir>`), MIME types are looked up per
  * asset URL, and the prerender slash redirect is relative. A base path is the case
- * where a mismatch between the adapter's asset keys and `appPath` would go
+ * where a mismatch between the adapter's asset keys and the app path would go
  * unnoticed, so it gets its own compiled executable.
  */
 const BASE = '/app';
 
-describe('a compiled app built with kit.paths.base', () => {
+describe('a compiled app built with paths.base', () => {
 	let server: SpawnedServer | null = null;
 	let base_url = '';
+	let out = '';
 
 	beforeAll(async () => {
-		const out = build_fixture({ out: 'build-base', base: BASE });
+		// `precompress: false` shares this build too, rather than compiling a
+		// dedicated executable — see the assertions at the bottom of this file.
+		out = build_fixture({ out: 'build-base', base: BASE, precompress: false });
 		({ base_url, server } = await start_app([join(out, 'app')], { label: 'base-path-app' }));
 	}, 240_000);
 
@@ -41,9 +45,9 @@ describe('a compiled app built with kit.paths.base', () => {
 
 	test('hashed assets under <base>/_app/immutable are cached forever', async () => {
 		const html = await fetch(url('/assets')).then((r) => r.text());
-		const hashed = [...html.matchAll(/(?:src|href)="((?:\.\/|\/app\/)_app\/immutable\/[^"]+)"/g)].map(
-			([, ref]) => (ref.startsWith('./') ? `${BASE}/${ref.slice(2)}` : ref)
-		);
+		const hashed = [
+			...html.matchAll(/(?:src|href)="((?:\.\/|\/app\/)_app\/immutable\/[^"]+)"/g)
+		].map(([, ref]) => (ref.startsWith('./') ? `${BASE}/${ref.slice(2)}` : ref));
 		expect(hashed.length).toBeGreaterThan(0);
 
 		for (const path of hashed) {
@@ -89,5 +93,19 @@ describe('a compiled app built with kit.paths.base', () => {
 		const res = await fetch(`${base_url}/about`);
 		await res.arrayBuffer();
 		expect(res.status).toBe(404);
+	});
+
+	test('precompress: false never negotiates a compressed representation', async () => {
+		const res = await fetch(url('/extra.css'), { headers: { 'accept-encoding': 'br, gzip' } });
+		await res.arrayBuffer();
+		expect(res.status).toBe(200);
+		expect(res.headers.get('content-encoding')).toBeNull();
+		expect(res.headers.get('vary')).toBeNull();
+	});
+
+	test('precompress: false embeds no .br/.gz variants in the generated entry', () => {
+		const entry_source = readFileSync(join(out, 'entry.js'), 'utf8');
+		expect(entry_source).not.toContain('.br"');
+		expect(entry_source).not.toContain('.gz"');
 	});
 });

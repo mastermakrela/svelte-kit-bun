@@ -12,7 +12,7 @@ import {
 const CONFIGURED_ORIGIN = 'https://configured.example.com';
 
 /**
- * End-to-end smoke test of a SvelteKit 3 build: `kit.paths.origin` replaced the
+ * End-to-end smoke test of a SvelteKit 3 build: `paths.origin` replaced the
  * adapter-level `ORIGIN` environment variable, so the origin has to be baked into
  * the generated entry at build time and honored at runtime.
  */
@@ -28,7 +28,7 @@ describe('SvelteKit 3 build', () => {
 		expect(source).not.toContain('ORIGIN');
 	});
 
-	describe('with kit.paths.origin configured', () => {
+	describe('with paths.origin configured', () => {
 		let server: SpawnedServer | null = null;
 		let base_url = '';
 		let entry = '';
@@ -54,7 +54,7 @@ describe('SvelteKit 3 build', () => {
 			expect(entry).toContain(`origin: ${JSON.stringify(CONFIGURED_ORIGIN)}`);
 		});
 
-		test('kit.paths.origin determines the request origin', async () => {
+		test('paths.origin determines the request origin', async () => {
 			const res = await fetch(`${base_url}/origin`);
 			expect(res.status).toBe(200);
 			expect(await res.text()).toBe(CONFIGURED_ORIGIN);
@@ -66,7 +66,7 @@ describe('SvelteKit 3 build', () => {
 		});
 	});
 
-	describe('with kit.paths.origin unset', () => {
+	describe('with paths.origin unset', () => {
 		let server: SpawnedServer | null = null;
 		let base_url = '';
 		let entry = '';
@@ -87,10 +87,13 @@ describe('SvelteKit 3 build', () => {
 			expect(entry).not.toContain('origin:');
 		});
 
-		test('falls back to the request-derived origin', async () => {
+		test('falls back to the request-derived origin, defaulting the protocol to https', async () => {
+			// no PROTOCOL_HEADER is configured, so the derived origin defaults to
+			// `https` per upstream adapter-node's `get_origin` — even though this
+			// dev server itself is plain http
 			const res = await fetch(`${base_url}/origin`);
 			expect(res.status).toBe(200);
-			expect(await res.text()).toBe(base_url);
+			expect(await res.text()).toBe(base_url.replace(/^http:/, 'https:'));
 		});
 	});
 });

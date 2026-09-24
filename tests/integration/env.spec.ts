@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
 	build_fixture,
@@ -16,6 +19,27 @@ import {
  * the behaviour lives in `serve.js`, which is identical in both modes, and the specs
  * there each need several differently configured app starts.
  */
+
+/**
+ * GET over a brand-new connection. With an idle timeout configured the server closes
+ * pooled keep-alive sockets between tests, and `fetch` would reuse one of those and fail
+ * with "other side closed" (or reject for the wrong reason). `agent: false` rules that out.
+ */
+function fresh_get(
+	url: string
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+	return new Promise((resolve, reject) => {
+		http
+			.get(url, { agent: false }, (res) => {
+				let body = '';
+				res.setEncoding('utf8');
+				res.on('data', (chunk) => (body += chunk));
+				res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
+				res.on('error', reject);
+			})
+			.on('error', reject);
+	});
+}
 
 /** Run a built app to completion, returning its exit code and stderr. */
 function run_until_exit(
@@ -76,7 +100,7 @@ describe('envPrefix collision detection (compiled executable)', () => {
 		expect(stderr).toContain('CONNECTION_IDLE_TIMEOUT');
 	});
 
-	test.each(['MY_APP_SOCKET_PATH=/tmp/x', 'MY_APP_KEEP_ALIVE_TIMEOUT=5', 'MY_APP_LISTEN_FDS=1'])(
+	test.each(['MY_APP_KEEP_ALIVE_TIMEOUT=5', 'MY_APP_LISTEN_FDS=1'])(
 		'%s aborts startup',
 		async (pair) => {
 			const [name, value] = pair.split('=');
@@ -177,19 +201,19 @@ describe('idle timeout semantics', () => {
 		afterAll(() => stop_app(server));
 
 		test('a fast response is unaffected', async () => {
-			const res = await fetch(`${base_url}/slow?delay=200`);
+			const res = await fresh_get(`${base_url}/slow?delay=200`);
 			expect(res.status).toBe(200);
 		});
 
 		test('a quiet non-streaming request is closed once configured', async () => {
-			await expect(fetch(`${base_url}/slow?delay=8000`)).rejects.toThrow();
+			await expect(fresh_get(`${base_url}/slow?delay=8000`)).rejects.toThrow(/socket hang up/);
 		}, 30_000);
 
 		test('an SSE stream is exempted from the configured timeout', async () => {
-			const res = await fetch(`${base_url}/stream?gap=4000&ticks=2`);
+			const res = await fresh_get(`${base_url}/stream?gap=4000&ticks=2`);
 			expect(res.status).toBe(200);
-			expect(res.headers.get('x-accel-buffering')).toBe('no');
-			expect(await res.text()).toContain('data: tick 1');
+			expect(res.headers['x-accel-buffering']).toBe('no');
+			expect(res.body).toContain('data: tick 1');
 		}, 30_000);
 	});
 
@@ -206,5 +230,89 @@ describe('idle timeout semantics', () => {
 
 		expect(code).not.toBe(0);
 		expect(stderr).toMatch(pattern);
+	});
+
+	describe('SOCKET_PATH', () => {
+		/** GET over a unix socket — `fetch`'s `unix` option is Bun-only, unavailable under vitest's Node worker. */
+		function socket_get(
+			socket_path: string,
+			path: string
+		): Promise<{ status: number; body: string }> {
+			return new Promise((resolve, reject) => {
+				const req = http.request({ socketPath: socket_path, path, method: 'GET' }, (res) => {
+					let body = '';
+					res.setEncoding('utf8');
+					res.on('data', (chunk) => (body += chunk));
+					res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+				});
+				req.on('error', reject);
+				req.end();
+			});
+		}
+
+		/**
+		 * No TCP endpoint to poll here, so retry a real request until the socket
+		 * answers. A stale (empty, non-socket) file may already sit at the path
+		 * before the app starts — `existsSync` alone can't tell that apart from a
+		 * live socket, so this retries the connection itself instead.
+		 */
+		async function wait_for_socket(socket_path: string, path: string, timeout_ms: number) {
+			const deadline = Date.now() + timeout_ms;
+			for (;;) {
+				try {
+					return await socket_get(socket_path, path);
+				} catch (err) {
+					if (Date.now() >= deadline) {
+						throw new Error(
+							`socket at ${socket_path} did not answer within ${timeout_ms}ms: ${err}`
+						);
+					}
+					await new Promise((r) => setTimeout(r, 100));
+				}
+			}
+		}
+
+		let dir = '';
+
+		beforeAll(() => {
+			dir = mkdtempSync(join(tmpdir(), 'adapter-bun-socket-'));
+		});
+
+		afterAll(() => {
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		test('serves requests over a unix socket instead of HOST/PORT', async () => {
+			const socket_path = join(dir, 'app.sock');
+			const server = spawn('bun', [entry], {
+				env: { ...process.env, SOCKET_PATH: socket_path },
+				stdio: ['ignore', 'pipe', 'pipe']
+			}) as SpawnedServer;
+
+			try {
+				const res = await wait_for_socket(socket_path, '/about', 15_000);
+				expect(res.status).toBe(200);
+				expect(res.body).toContain('About (prerendered)');
+			} finally {
+				await stop_app(server);
+			}
+		}, 30_000);
+
+		test('an empty stale socket file at the path does not prevent startup', async () => {
+			const socket_path = join(dir, 'stale.sock');
+			writeFileSync(socket_path, '');
+
+			const server = spawn('bun', [entry], {
+				env: { ...process.env, SOCKET_PATH: socket_path },
+				stdio: ['ignore', 'pipe', 'pipe']
+			}) as SpawnedServer;
+
+			try {
+				const res = await wait_for_socket(socket_path, '/about', 15_000);
+				expect(res.status).toBe(200);
+			} finally {
+				await stop_app(server);
+			}
+		}, 30_000);
 	});
 });

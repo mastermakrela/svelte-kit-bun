@@ -13,6 +13,7 @@ export default defineConfig({
 			adapter: adapter({
 				out: process.env.ADAPTER_BUN_OUT ?? 'build',
 				compile: process.env.ADAPTER_BUN_COMPILE !== 'false',
+				precompress: process.env.ADAPTER_BUN_PRECOMPRESS !== 'false',
 				envPrefix: process.env.ADAPTER_BUN_ENV_PREFIX ?? ''
 			}),
 			paths: {

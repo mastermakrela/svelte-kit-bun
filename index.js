@@ -1,5 +1,6 @@
-import { mkdirSync, rmSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readSync, rmSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
+import { createHash } from 'node:crypto';
 import { generate_entry } from './src/codegen.js';
 import { apply_windows_branding } from './src/windows-brand.js';
 
@@ -18,6 +19,43 @@ const NATIVE_ADDON_PACKAGES = [
 ];
 
 /**
+ * Dotfiles are not embedded, with the customary exception of `.well-known/`,
+ * mirroring upstream adapter-node's `is_hidden`.
+ * @param {string} file - relative to the client output dir, no leading slash
+ */
+function is_hidden(file) {
+	return (
+		file.split('/').some((segment) => segment.startsWith('.')) && !file.startsWith('.well-known/')
+	);
+}
+
+/**
+ * Size and content hash (sha256, base64url) from one pass over the file, a buffer
+ * at a time, mirroring upstream adapter-node's `measure` — so large embedded
+ * assets are neither read fully into memory nor hashed twice.
+ * @param {string} path
+ * @param {Buffer} buffer
+ * @returns {{ size: number, etag: string }}
+ */
+function measure(path, buffer) {
+	const fd = openSync(path, 'r');
+	const hash = createHash('sha256');
+	let size = 0;
+
+	try {
+		let read;
+		while ((read = readSync(fd, buffer)) > 0) {
+			hash.update(buffer.subarray(0, read));
+			size += read;
+		}
+	} finally {
+		closeSync(fd);
+	}
+
+	return { size, etag: hash.digest('base64url') };
+}
+
+/**
  * A build job's target is a Windows one if it explicitly names a
  * `bun-windows-*` triple, or — when no target is given — the host running
  * the build is Windows itself (Bun then compiles for the host).
@@ -29,7 +67,15 @@ function is_windows_target(target) {
 
 /** @type {import('./index.js').default} */
 export default function plugin(opts = {}) {
-	const { out = 'build', binaryName = 'app', envPrefix = '', compile = true, targets, windows } = opts;
+	const {
+		out = 'build',
+		binaryName = 'app',
+		envPrefix = '',
+		compile = true,
+		precompress = true,
+		targets,
+		windows
+	} = opts;
 
 	return {
 		name: '@sveltejs/adapter-bun',
@@ -48,21 +94,38 @@ export default function plugin(opts = {}) {
 			rmSync(tmp, { force: true, recursive: true });
 			mkdirSync(tmp, { recursive: true });
 
-			const base = builder.config.kit.paths.base;
+			const base = builder.config.paths.base;
+
+			const client_dir = `${out}/client${base}`;
+			const prerendered_dir = `${out}/prerendered${base}`;
 
 			builder.log.minor('Copying assets');
-			const client_files = builder.writeClient(`${out}/client${base}`);
-			builder.writePrerendered(`${out}/prerendered${base}`);
+			const client_files = builder.writeClient(client_dir);
+			builder.writePrerendered(prerendered_dir);
+
+			builder.log.minor(precompress ? 'Compressing assets' : 'Skipping precompression');
+			// `builder.compress` always writes a `.gz` *and* a `.br` sibling for every file it
+			// returns (never just one), so membership in the returned list is enough to know
+			// both variants exist — no need to check each on disk separately.
+			const [client_compressed, prerendered_compressed] = precompress
+				? await Promise.all([builder.compress(client_dir), builder.compress(prerendered_dir)])
+				: [[], []];
+			const client_compressed_set = new Set(client_compressed);
+			const prerendered_compressed_set = new Set(prerendered_compressed);
 
 			builder.log.minor('Building server');
-			builder.writeServer(`${out}/server`);
+			const server_dir = `${out}/server`;
+			builder.writeServer(server_dir);
+			builder.generateServerInstance(`${server_dir}/server.js`, { serverDirectory: server_dir });
 
+			// values only known after the build
 			await Bun.write(
-				`${out}/server/manifest.js`,
+				`${server_dir}/manifest.js`,
 				[
-					`export const manifest = ${builder.generateManifest({ relativePath: './' })};`,
-					`export const prerendered = new Set(${JSON.stringify(builder.prerendered.paths)});`
-				].join('\n\n')
+					`export const prerendered = new Set(${JSON.stringify(builder.prerendered.paths)});`,
+					`export const app_path = ${JSON.stringify(builder.getAppPath())};`,
+					`export const mime_types = ${JSON.stringify(builder.mimeTypes)};`
+				].join('\n')
 			);
 
 			builder.copy(files, out);
@@ -71,27 +134,72 @@ export default function plugin(opts = {}) {
 			// layout under `${out}/client` carries the base prefix, so reconstruct it.
 			const base_segment = base ? `${base.slice(1)}/` : '';
 
+			// one shared buffer for every `measure()` call below, mirroring upstream's `measure_files`
+			const hash_buffer = Buffer.allocUnsafe(64 * 1024);
+
+			// `builder.compress` returns paths relative to the directory it compressed, matching
+			// `rel` below one-for-one — when present there, both `.br` and `.gz` siblings exist.
+			/**
+			 * @param {string} rel
+			 * @param {string} path - on-disk path to the uncompressed file (same as passed to `measure`)
+			 * @param {string} import_path - import path to the uncompressed file
+			 * @param {Set<string>} compressed_set
+			 */
+			function compressed_variants(rel, path, import_path, compressed_set) {
+				if (!compressed_set.has(rel)) return {};
+				return {
+					br: { import_path: `${import_path}.br`, size: statSync(`${path}.br`).size },
+					gz: { import_path: `${import_path}.gz`, size: statSync(`${path}.gz`).size }
+				};
+			}
+
+			// Dotfiles are skipped before they're even imported into entry.js, so they
+			// never end up embedded in the executable.
 			/** @type {import('./src/codegen.js').AssetEntry[]} */
-			const client_assets = client_files.map((rel) => ({
-				import_path: `./client/${base_segment}${rel}`,
-				key: `/${base_segment}${rel}`
-			}));
+			const client_assets = client_files
+				.filter((rel) => !is_hidden(rel))
+				.map((rel) => {
+					const path = `${client_dir}/${rel}`;
+					const { size, etag } = measure(path, hash_buffer);
+					const import_path = `./client/${base_segment}${rel}`;
+					return {
+						import_path,
+						key: `/${base_segment}${rel}`,
+						size,
+						etag,
+						...compressed_variants(rel, path, import_path, client_compressed_set)
+					};
+				});
 
 			// Prerendered pages: URL key may differ from on-disk filename
 			// (e.g. `/foo` → `foo.html`), so use builder.prerendered.pages as source of truth.
 			/** @type {import('./src/codegen.js').AssetEntry[]} */
 			const prerendered_assets = [];
 			for (const [url_path, { file }] of builder.prerendered.pages) {
+				const path = `${prerendered_dir}/${file}`;
+				const { size, etag } = measure(path, hash_buffer);
+				const import_path = `./prerendered/${base_segment}${file}`;
 				prerendered_assets.push({
-					import_path: `./prerendered/${base_segment}${file}`,
-					key: url_path
+					import_path,
+					key: url_path,
+					size,
+					etag,
+					...compressed_variants(file, path, import_path, prerendered_compressed_set)
 				});
 			}
 			// Non-HTML prerendered assets: URL path mirrors the on-disk layout.
 			for (const [url_path] of builder.prerendered.assets) {
+				const rel = url_path.slice(base.length + 1);
+				if (is_hidden(rel)) continue;
+				const path = `${out}/prerendered${url_path}`;
+				const { size, etag } = measure(path, hash_buffer);
+				const import_path = `./prerendered${url_path}`;
 				prerendered_assets.push({
-					import_path: `./prerendered${url_path}`,
-					key: url_path
+					import_path,
+					key: url_path,
+					size,
+					etag,
+					...compressed_variants(rel, path, import_path, prerendered_compressed_set)
 				});
 			}
 
@@ -104,16 +212,16 @@ export default function plugin(opts = {}) {
 			}));
 
 			const entry_source = generate_entry({
-				server_index_path: './server/index.js',
+				server_path: './server/server.js',
 				manifest_path: './server/manifest.js',
 				serve_path: './serve.js',
 				client_assets,
 				prerendered_assets,
 				server_assets,
-				// `kit.paths.origin` is baked in at build time (Kit validates and
+				// `paths.origin` is baked in at build time (Kit validates and
 				// normalizes it); when unset the runtime derives the origin from the
 				// request and any configured proxy headers.
-				origin: builder.config.kit.paths.origin,
+				origin: builder.config.paths.origin,
 				env_prefix: envPrefix
 			});
 
@@ -127,7 +235,14 @@ export default function plugin(opts = {}) {
 				builder.log.minor('Instrumenting entry point');
 				builder.instrument({
 					entrypoint: `${out}/entry.js`,
-					instrumentation: `${out}/server/instrumentation.server.js`,
+					instrumentation: `${server_dir}/instrumentation.server.js`,
+					// populates `$env/dynamic/private` from `process.env` before the
+					// instrumentation runs; it lives next to the server output so the facade's
+					// relative import resolves when Bun.build bundles it
+					initializer: builder.createInstrumentationInitializer({
+						outputDirectory: server_dir,
+						serverDirectory: server_dir
+					}),
 					// the generated entry is a side-effect-only script (`await start({...})`),
 					// so there is nothing to re-export from the renamed module
 					module: { exports: [] }
@@ -230,7 +345,7 @@ export default function plugin(opts = {}) {
 
 			const pkg_file = Bun.file('package.json');
 			if (await pkg_file.exists()) {
-				/** @type {unknown} */
+				/** @type {{ dependencies?: object, devDependencies?: object, optionalDependencies?: object } | null} */
 				let pkg;
 				try {
 					pkg = await pkg_file.json();
@@ -240,17 +355,11 @@ export default function plugin(opts = {}) {
 					);
 					pkg = null;
 				}
-				if (pkg && typeof pkg === 'object') {
+				if (pkg) {
 					const combined = {
-						.../** @type {Record<string, unknown>} */ (
-							/** @type {Record<string, unknown>} */ (pkg).dependencies ?? {}
-						),
-						.../** @type {Record<string, unknown>} */ (
-							/** @type {Record<string, unknown>} */ (pkg).devDependencies ?? {}
-						),
-						.../** @type {Record<string, unknown>} */ (
-							/** @type {Record<string, unknown>} */ (pkg).optionalDependencies ?? {}
-						)
+						...pkg.dependencies,
+						...pkg.devDependencies,
+						...pkg.optionalDependencies
 					};
 					const offenders = NATIVE_ADDON_PACKAGES.filter((name) => name in combined);
 					if (offenders.length > 0) {

@@ -5,7 +5,14 @@
 ## Requirements
 
 - [Bun](https://bun.com/) >= 1.2.17 — the build and the resulting binary both run under Bun.
-- SvelteKit 3 (currently prerelease: `@sveltejs/kit@next`).
+- SvelteKit 3 `>= 3.0.0-next.27` (currently prerelease: `@sveltejs/kit@next`). This release line (`0.7`) uses the Kit 3 adapter API (`builder.generateServerInstance`, `builder.createInstrumentationInitializer`, `paths.origin`) and does not work with SvelteKit 2.
+
+| SvelteKit      | svelte-kit-bun | install                          |
+| -------------- | -------------- | -------------------------------- |
+| 3 (prerelease) | `0.7.0-next.*` | `bun add -d svelte-kit-bun@next` |
+| 2              | `0.6.x`        | `bun add -d svelte-kit-bun@0.6`  |
+
+Until SvelteKit 3 is stable, the default (`latest`) install stays on `0.6.x`, mirroring upstream's `@sveltejs/adapter-node@5` (Kit 2) / `@6` (Kit 3) split.
 
 ## Caveats
 
@@ -50,17 +57,28 @@ adapter({ compile: false });
 
 Then run `bun run build/entry.js`. This keeps native addons working and makes iteration faster at the cost of shipping Bun alongside the app.
 
+### Precompression
+
+`precompress` (default `true`) mirrors `@sveltejs/adapter-node`'s option of the same name: client and prerendered assets are additionally compressed with gzip and brotli at build time (via `builder.compress`, which only compresses certain text-like extensions — `.html`, `.js`, `.mjs`, `.json`, `.css`, `.svg`, `.xml`, `.wasm`, `.txt`, `.md`, `.mdx`), and both variants are embedded in the executable alongside the original.
+
+```js
+adapter({ precompress: false });
+```
+
+**Trade-off:** each compressible asset is embedded up to 3× (raw + gzip + brotli), so the executable grows. Set `precompress: false` for a smaller binary at the cost of the server always sending uncompressed bodies.
+
 ### Environment variables
 
 The built app reads exactly these variables at startup — nothing else:
 
 | Variable                  | Default   | Description                                                                                                                                            |
 | ------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `HOST`                    | `0.0.0.0` | Hostname to bind to.                                                                                                                                   |
-| `PORT`                    | `3000`    | Port to listen on (integer, 0–65535).                                                                                                                  |
+| `HOST`                    | `0.0.0.0` | Hostname to bind to. Ignored when `SOCKET_PATH` is set.                                                                                                |
+| `PORT`                    | `3000`    | Port to listen on (integer, 0–65535). Ignored when `SOCKET_PATH` is set.                                                                               |
+| `SOCKET_PATH`             | —         | Path to a unix socket to listen on instead of `HOST`/`PORT`. A stale empty file already at that path is removed before binding.                        |
 | `ADDRESS_HEADER`          | —         | Header to read the client address from, e.g. `X-Forwarded-For`. Without it, the socket address is used.                                                |
 | `XFF_DEPTH`               | `1`       | How many trusted proxies sit in front of the app, counted from the right of `X-Forwarded-For`.                                                         |
-| `PROTOCOL_HEADER`         | —         | Header carrying the forwarded protocol, e.g. `X-Forwarded-Proto`.                                                                                      |
+| `PROTOCOL_HEADER`         | —         | Header carrying the forwarded protocol, e.g. `X-Forwarded-Proto`. Without it, the derived origin defaults to `https`.                                  |
 | `HOST_HEADER`             | —         | Header carrying the forwarded host, e.g. `X-Forwarded-Host`.                                                                                           |
 | `PORT_HEADER`             | —         | Header carrying the forwarded port, e.g. `X-Forwarded-Port`.                                                                                           |
 | `BODY_SIZE_LIMIT`         | `512K`    | Maximum request body size; a number of bytes, optionally suffixed with `K`, `M` or `G`.                                                                |
@@ -80,11 +98,21 @@ Invalid values (a non-numeric `PORT`, a `CONNECTION_IDLE_TIMEOUT` above 255, …
 
 `Bun.serve` closes a connection after 10 seconds of inactivity by default, and counts an in-flight request whose handler hasn't written any bytes yet as inactive. That would break slow responses and quiet server-sent-events streams (SvelteKit's `query.live`, for instance, only sends a keep-alive comment every 30 seconds), so **this adapter defaults `CONNECTION_IDLE_TIMEOUT` to `0`, i.e. no idle timeout**. Set it to a positive number of seconds (up to 255) if you want Bun to reap idle connections; responses with `content-type: text/event-stream` are exempted from it automatically.
 
-This is deliberately _not_ adapter-node's `IDLE_TIMEOUT`, which shuts the whole process down after a period without requests and only has an effect under systemd socket activation. Socket activation is not supported here, so the adapter-node-only variables `IDLE_TIMEOUT`, `SOCKET_PATH`, `KEEP_ALIVE_TIMEOUT`, `HEADERS_TIMEOUT`, `LISTEN_PID` and `LISTEN_FDS` are not part of the supported surface: with an `envPrefix` set, a prefixed one aborts startup with an explanation; without a prefix (where the variable may well belong to another process) the app logs a warning and ignores it.
+This is deliberately _not_ adapter-node's `IDLE_TIMEOUT`, which shuts the whole process down after a period without requests and only has an effect under systemd socket activation. Socket activation is not supported here, so the adapter-node-only variables `IDLE_TIMEOUT`, `KEEP_ALIVE_TIMEOUT`, `HEADERS_TIMEOUT`, `LISTEN_PID` and `LISTEN_FDS` are not part of the supported surface: with an `envPrefix` set, a prefixed one aborts startup with an explanation; without a prefix (where the variable may well belong to another process) the app logs a warning and ignores it.
+
+### Graceful shutdown
+
+On `SIGTERM`/`SIGINT` the server stops accepting new connections and waits up to `SHUTDOWN_TIMEOUT` seconds for in-flight requests to finish before closing the rest forcibly. Once shutdown has completed — gracefully or forced — the app emits `process.emit('sveltekit:shutdown', reason)` with `reason` set to the triggering signal (`'SIGINT'` or `'SIGTERM'`), mirroring `@sveltejs/adapter-node`. Listen for it to clean up resources such as a database connection pool:
+
+```js
+process.on('sveltekit:shutdown', async (reason) => {
+  await db.close();
+});
+```
 
 ### Origin
 
-The origin used for request URLs and CSRF checks comes from SvelteKit's [`kit.paths.origin`](https://svelte.dev/docs/kit/configuration#paths) and is baked into the binary at build time:
+The origin used for request URLs and CSRF checks comes from SvelteKit's [`paths.origin`](https://svelte.dev/docs/kit/configuration#paths) and is baked into the binary at build time:
 
 ```js
 sveltekit({
@@ -93,7 +121,9 @@ sveltekit({
 });
 ```
 
-There is no `ORIGIN` environment variable (SvelteKit 3 removed it from the adapter contract). When `kit.paths.origin` is not set, the origin is derived from the incoming request, optionally corrected by the `PROTOCOL_HEADER`, `HOST_HEADER`, and `PORT_HEADER` environment variables when running behind a reverse proxy.
+There is no `ORIGIN` environment variable (SvelteKit 3 removed it from the adapter contract). When `paths.origin` is not set, the origin is always derived from the incoming request, corrected by the `PROTOCOL_HEADER`, `HOST_HEADER`, and `PORT_HEADER` environment variables when running behind a reverse proxy. An unconfigured `PROTOCOL_HEADER` (or one absent from a given request) defaults the derived protocol to `https`, since an app without that header configured is assumed to sit behind a TLS-terminating proxy rather than to be served over plain `http`.
+
+A malformed or ambiguous proxy header — a `PROTOCOL_HEADER` value containing `:`, a non-numeric `PORT_HEADER` value, or a comma-joined value for any of `PROTOCOL_HEADER`/`HOST_HEADER`/`PORT_HEADER` (each expects exactly one value; Bun already joins a repeated header with `, `) — fails the request with `400 Bad Request` and logs `Could not determine request origin: …` to stderr, rather than falling through to a generic `500`.
 
 ### Server instrumentation
 
@@ -106,7 +136,7 @@ import { NodeSDK } from '@opentelemetry/sdk-node';
 new NodeSDK({/* ... */}).start();
 ```
 
-To make it work, the adapter turns the generated `build/entry.js` into a small facade — it imports the instrumentation module and then `await import`s `build/start.js` (the real entry point), which is what `builder.instrument()` produces. Both graphs are compiled into the executable, so the instrumentation code and its dependencies ship inside the binary.
+To make it work, the adapter turns the generated `build/entry.js` into a small facade — it imports SvelteKit's environment initializer (so `$app/env/private` is already populated from `process.env`), then the instrumentation module, and then `await import`s `build/start.js` (the real entry point), which is what `builder.instrument()` produces. Both graphs are compiled into the executable, so the instrumentation code and its dependencies ship inside the binary.
 
 Two Bun-specific caveats:
 
@@ -117,8 +147,14 @@ Two Bun-specific caveats:
 
 Embedded assets are served with the same semantics as `@sveltejs/adapter-node`:
 
-- `content-type` comes from SvelteKit's manifest (`manifest.mimeTypes`), so types SvelteKit knows about are used rather than only Bun's extension mapping; `text/html` gains `;charset=utf-8`.
+- `content-type` comes from SvelteKit's MIME metadata (`builder.mimeTypes`, recorded at build time), so types SvelteKit knows about are used rather than only Bun's extension mapping; `text/html` gains `;charset=utf-8`.
 - Hashed client build output under `/{appPath}/immutable/` is served with `cache-control: public,max-age=31536000,immutable`. Other assets (e.g. `_app/version.json`, files from `static/`) are not.
+- Every static response carries an `ETag` (sha256/base64url hash of the file contents, computed at build time). A matching `If-None-Match` (exact, weak `W/"..."`, or `*`) returns `304 Not Modified` with only the `etag` and `cache-control` headers.
+- When `precompress` produced a gzip/brotli variant for an asset (see [Precompression](#precompression)), the response negotiates `Accept-Encoding` (brotli preferred over gzip, `q` values honored, `*` as a fallback weight): a chosen variant is served with `content-encoding: gzip`/`br`, its own size, and an etag suffixed `.gz`/`.br`; the response also carries `Vary: Accept-Encoding`. Range and conditional (`If-None-Match`/`If-Range`) requests apply to whichever representation — raw or variant — was negotiated.
+- `Range` requests are supported: `bytes=start-end`, an open-ended `bytes=start-`, and a suffix `bytes=-N` are all honored; an `end` past the end of the file is clamped to `size - 1` rather than rejected; a `Range` with neither bound (`bytes=-`) is ignored and falls through to a full response; `start >= size` or `start > end` returns `416 Range Not Satisfiable` with `content-range: bytes */size`. `If-Range` is honored — the range is only served when `If-Range` is absent or matches the current `ETag`; otherwise the full current representation is returned.
+- Every method other than `GET`/`HEAD` — including `OPTIONS` — gets `405 Method Not Allowed` with `allow: GET, HEAD`.
+- Dotfiles under `static/` (any path segment starting with `.`) are not embedded in the executable or served, except under `.well-known/`.
+- A `.html` file in `static/` gets clean-URL aliases: `/foo` and `/foo/` resolve to `foo.html`, or to `foo/index.html` when only that exists. An exact file always wins over an alias, and when both `foo.html` and `foo/index.html` exist, `foo.html` claims the aliases.
 - Trailing-slash redirects for prerendered pages use a **relative** `location` (e.g. `../about`), so they keep working behind a proxy that strips a mount prefix. The query string is preserved.
 - Responses whose `content-type` is exactly `text/event-stream` get `x-accel-buffering: no`, which stops nginx-style proxies from buffering server-sent events.
 
@@ -164,8 +200,8 @@ bun run test:watch
 ```
 
 The integration specs build `tests/fixtures/basic-app` (a SvelteKit 3 app) in several
-shapes — compiled single-file executable, `compile: false`, with `kit.paths.origin`, with
-`kit.paths.base`, with `envPrefix`, with a server instrumentation file — start the result
+shapes — compiled single-file executable, `compile: false`, with `paths.origin`, with
+`paths.base`, with `envPrefix`, with a server instrumentation file — start the result
 and assert over real HTTP. They share the fixture directory, so spec files never run in
 parallel (see `vitest.config.ts`).
 

@@ -1,8 +1,8 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`generate_entry > happy path: snapshot 1`] = `
-"import { Server } from "./server/index.js";
-import { manifest, prerendered } from "./server/manifest.js";
+"import { server } from "./server/server.js";
+import { prerendered, app_path, mime_types } from "./server/manifest.js";
 import { start } from "./serve.js";
 
 import _client_0 from "./client/favicon.png" with { type: 'file' };
@@ -11,20 +11,53 @@ import _prerendered_0 from "./prerendered/about.html" with { type: 'file' };
 import _server_0 from "./server/_app/immutable/assets/data.bin" with { type: 'file' };
 
 const client_assets = {
-	"/favicon.png": _client_0,
-	"/_app/immutable/chunks/abc.js": _client_1
+	"/favicon.png": { file: _client_0, size: 1234, etag: "etag-favicon" },
+	"/_app/immutable/chunks/abc.js": { file: _client_1, size: 42, etag: "etag-abc" }
 };
 const prerendered_assets = {
-	"/about": _prerendered_0
+	"/about": { file: _prerendered_0, size: 99, etag: "etag-about" }
 };
 const server_assets = {
 	"data.bin": _server_0
 };
 
 await start({
-	Server,
-	manifest,
+	server,
 	prerendered,
+	app_path,
+	mime_types,
+	client_assets,
+	prerendered_assets,
+	server_assets
+});
+"
+`;
+
+exports[`generate_entry > precompressed variants: snapshot 1`] = `
+"import { server } from "./server/server.js";
+import { prerendered, app_path, mime_types } from "./server/manifest.js";
+import { start } from "./serve.js";
+
+import _client_0 from "./client/app.js" with { type: 'file' };
+import _client_0_br from "./client/app.js.br" with { type: 'file' };
+import _client_0_gz from "./client/app.js.gz" with { type: 'file' };
+import _prerendered_0 from "./prerendered/about.html" with { type: 'file' };
+import _prerendered_0_br from "./prerendered/about.html.br" with { type: 'file' };
+import _prerendered_0_gz from "./prerendered/about.html.gz" with { type: 'file' };
+
+const client_assets = {
+	"/app.js": { file: _client_0, size: 100, etag: "etag-app", br: { file: _client_0_br, size: 40 }, gz: { file: _client_0_gz, size: 60 } }
+};
+const prerendered_assets = {
+	"/about": { file: _prerendered_0, size: 200, etag: "etag-about", br: { file: _prerendered_0_br, size: 80 }, gz: { file: _prerendered_0_gz, size: 120 } }
+};
+const server_assets = {};
+
+await start({
+	server,
+	prerendered,
+	app_path,
+	mime_types,
 	client_assets,
 	prerendered_assets,
 	server_assets

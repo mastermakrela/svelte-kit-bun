@@ -10,6 +10,7 @@ import { build_fixture, start_app, stop_app, type SpawnedServer } from '../helpe
  * instrumentation module really ran before the application code.
  */
 const MARKER = 'INSTRUMENTATION_MARKER_9f3a71';
+const RUNTIME_SECRET = 'runtime-secret-4c1e';
 
 describe('server instrumentation (compiled executable)', () => {
 	let server: SpawnedServer | null = null;
@@ -18,15 +19,22 @@ describe('server instrumentation (compiled executable)', () => {
 
 	beforeAll(async () => {
 		out = build_fixture({ out: 'build-instrumented', instrumentation: true });
-		({ base_url, server } = await start_app([join(out, 'app')], { label: 'instrumented-app' }));
+		({ base_url, server } = await start_app([join(out, 'app')], {
+			label: 'instrumented-app',
+			env: { FIXTURE_RUNTIME_SECRET: RUNTIME_SECRET }
+		}));
 	}, 240_000);
 
 	afterAll(() => stop_app(server));
 
 	test('the generated entry is a facade that imports instrumentation first', () => {
 		const entry = readFileSync(join(out, 'entry.js'), 'utf8');
-		expect(entry).toContain("import './server/instrumentation.server.js';");
-		expect(entry).toContain("await import('./start.js')");
+		// kit's env initializer populates `$env/dynamic/private` before instrumentation runs
+		const initializer = entry.indexOf('import "./server/__sveltekit_env_init.js";');
+		const instrumentation = entry.indexOf('import "./server/instrumentation.server.js";');
+		expect(initializer).toBeGreaterThan(-1);
+		expect(instrumentation).toBeGreaterThan(initializer);
+		expect(entry).toContain('await import("./start.js")');
 		// the actual server bootstrap moved to start.js, so it is imported *after*
 		expect(entry).not.toContain('await start({');
 		expect(readFileSync(join(out, 'start.js'), 'utf8')).toContain('await start({');
@@ -35,7 +43,12 @@ describe('server instrumentation (compiled executable)', () => {
 	test('instrumentation ran before application code', async () => {
 		const res = await fetch(`${base_url}/instrumentation`);
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ order: ['instrumentation', 'app'], marker: MARKER });
+		expect(await res.json()).toEqual({
+			order: ['instrumentation', 'app'],
+			marker: MARKER,
+			// `$app/env/private` was already populated from the runtime environment
+			env: RUNTIME_SECRET
+		});
 	});
 
 	test('the compiled executable embeds the instrumentation module', () => {

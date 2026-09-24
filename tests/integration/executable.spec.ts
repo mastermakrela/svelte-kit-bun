@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import http from 'node:http';
+import { brotliDecompressSync, gunzipSync } from 'node:zlib';
 import {
 	build_fixture,
 	fixture,
@@ -8,6 +10,33 @@ import {
 	stop_app,
 	type SpawnedServer
 } from '../helpers/fixture.js';
+
+/**
+ * `fetch` (undici) auto-decompresses `gzip`/`br` bodies transparently, which would
+ * make a "decompresses to the original bytes" assertion pass even if the server sent
+ * the identity representation. A raw `node:http` request sidesteps that: it never sets
+ * `Accept-Encoding` on its own and hands back the exact bytes on the wire.
+ */
+function raw_request(
+	url: string,
+	headers: Record<string, string>
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
+	return new Promise((resolve, reject) => {
+		const req = http.request(url, { headers }, (res) => {
+			const chunks: Buffer[] = [];
+			res.on('data', (chunk) => chunks.push(chunk));
+			res.on('end', () =>
+				resolve({
+					status: res.statusCode ?? 0,
+					headers: res.headers,
+					body: Buffer.concat(chunks)
+				})
+			);
+		});
+		req.on('error', reject);
+		req.end();
+	});
+}
 
 const binary = join(fixture, 'build/app');
 
@@ -78,15 +107,19 @@ describe('compiled executable bundling', () => {
 		const html = await res.text();
 
 		// component style emitted hashed CSS
-		const css_hrefs = [...html.matchAll(/href="((?:\/|\.\/)_app\/immutable\/assets\/[^"]+\.css)"/g)].map(
-			(m) => m[1]
-		);
+		const css_hrefs = [
+			...html.matchAll(/href="((?:\/|\.\/)_app\/immutable\/assets\/[^"]+\.css)"/g)
+		].map((m) => m[1]);
 		expect(css_hrefs.length).toBeGreaterThan(0);
 
 		// imported SVG and PNG assets resolved to hashed URLs
 		const img_srcs = [...html.matchAll(/<img[^>]*src="([^"]+)"/g)].map((m) => m[1]);
-		const svg_hashed = img_srcs.find((s) => /(?:\/|\.\/)_app\/immutable\/assets\/logo\.[^"]*\.svg$/.test(s));
-		const png_hashed = img_srcs.find((s) => /(?:\/|\.\/)_app\/immutable\/assets\/pixel\.[^"]*\.png$/.test(s));
+		const svg_hashed = img_srcs.find((s) =>
+			/(?:\/|\.\/)_app\/immutable\/assets\/logo\.[^"]*\.svg$/.test(s)
+		);
+		const png_hashed = img_srcs.find((s) =>
+			/(?:\/|\.\/)_app\/immutable\/assets\/pixel\.[^"]*\.png$/.test(s)
+		);
 		expect(svg_hashed, `expected a hashed logo.svg in ${img_srcs.join(', ')}`).toBeTruthy();
 		expect(png_hashed, `expected a hashed pixel.png in ${img_srcs.join(', ')}`).toBeTruthy();
 
@@ -120,7 +153,9 @@ describe('compiled executable bundling', () => {
 
 	test('imported SVG asset is served with image/svg+xml', async () => {
 		const html = await fetch(`${base_url}/assets`).then((r) => r.text());
-		const svg_href = html.match(/src="((?:\/|\.\/)_app\/immutable\/assets\/logo\.[^"]*\.svg)"/)?.[1];
+		const svg_href = html.match(
+			/src="((?:\/|\.\/)_app\/immutable\/assets\/logo\.[^"]*\.svg)"/
+		)?.[1];
 		expect(svg_href).toBeTruthy();
 
 		const res = await fetch(`${base_url}${abs(svg_href!)}`);
@@ -131,7 +166,9 @@ describe('compiled executable bundling', () => {
 
 	test('imported PNG asset is served with image/png and correct bytes', async () => {
 		const html = await fetch(`${base_url}/assets`).then((r) => r.text());
-		const png_href = html.match(/src="((?:\/|\.\/)_app\/immutable\/assets\/pixel\.[^"]*\.png)"/)?.[1];
+		const png_href = html.match(
+			/src="((?:\/|\.\/)_app\/immutable\/assets\/pixel\.[^"]*\.png)"/
+		)?.[1];
 		expect(png_href).toBeTruthy();
 
 		const on_disk = readFileSync(join(fixture, 'src/lib/pixel.png'));
@@ -167,7 +204,7 @@ describe('without a server instrumentation file', () => {
 		expect(readFileSync(join(fixture, 'build/entry.js'), 'utf8')).toContain('await start({');
 
 		const res = await fetch(`${base_url}/instrumentation`);
-		expect(await res.json()).toEqual({ order: ['app'], marker: null });
+		expect(await res.json()).toEqual({ order: ['app'], marker: null, env: null });
 	});
 });
 
@@ -181,10 +218,10 @@ describe('response semantics', () => {
 		expect(res.headers.get('content-type')).toBe('image/jxl');
 	});
 
-	test('static MIME types equal the manifest’s metadata exactly', async () => {
+	test('static MIME types equal the build’s `builder.mimeTypes` exactly', async () => {
 		const manifest_source = readFileSync(join(fixture, 'build/server/manifest.js'), 'utf8');
 		const mime_types = JSON.parse(
-			manifest_source.match(/mimeTypes: (\{.*?\}),\n/s)![1]
+			manifest_source.match(/^export const mime_types = (\{.*\});$/m)![1]
 		) as Record<string, string>;
 		expect(mime_types['.jxl']).toBe('image/jxl');
 
@@ -253,5 +290,178 @@ describe('response semantics', () => {
 		const res = await fetch(`${base_url}/`);
 		await res.arrayBuffer();
 		expect(res.headers.get('x-accel-buffering')).toBeNull();
+	});
+});
+
+// Static-asset semantics parity with `@sveltejs/adapter-node`'s `static.js`.
+describe('static asset semantics', () => {
+	test('OPTIONS on a static asset returns 405 with allow: GET, HEAD', async () => {
+		const res = await fetch(`${base_url}/favicon.png`, { method: 'OPTIONS' });
+		expect(res.status).toBe(405);
+		expect(res.headers.get('allow')).toBe('GET, HEAD');
+	});
+
+	test('POST on a static asset returns 405', async () => {
+		const res = await fetch(`${base_url}/favicon.png`, { method: 'POST' });
+		expect(res.status).toBe(405);
+		expect(res.headers.get('allow')).toBe('GET, HEAD');
+	});
+
+	test('a dotfile in static/ is not served, even though it is on disk', async () => {
+		expect(existsSync(join(fixture, 'static/.hidden'))).toBe(true);
+		const res = await fetch(`${base_url}/.hidden`);
+		expect(res.status).toBe(404);
+	});
+
+	test('static/.hidden is not embedded in the compiled executable', () => {
+		const source = readFileSync(join(fixture, 'build/entry.js'), 'utf8');
+		expect(source).not.toContain('.hidden');
+	});
+
+	test('a dotfile under .well-known/ is served', async () => {
+		const res = await fetch(`${base_url}/.well-known/x.txt`);
+		expect(res.status).toBe(200);
+		expect(await res.text()).toContain('well-known-content');
+	});
+
+	test('a static asset response carries an ETag', async () => {
+		const res = await fetch(`${base_url}/favicon.png`);
+		await res.arrayBuffer();
+		expect(res.headers.get('etag')).toMatch(/^"[\w-]+"$/);
+	});
+
+	test('a matching If-None-Match returns 304 with etag + cache-control only', async () => {
+		const first = await fetch(`${base_url}/favicon.png`);
+		await first.arrayBuffer();
+		const etag = first.headers.get('etag')!;
+		expect(etag).toBeTruthy();
+
+		const res = await fetch(`${base_url}/favicon.png`, { headers: { 'if-none-match': etag } });
+		expect(res.status).toBe(304);
+		expect(res.headers.get('etag')).toBe(etag);
+		expect(res.headers.get('content-length')).toBeNull();
+		const body = await res.arrayBuffer();
+		expect(body.byteLength).toBe(0);
+	});
+
+	test('a non-matching If-None-Match returns the full 200', async () => {
+		const res = await fetch(`${base_url}/favicon.png`, {
+			headers: { 'if-none-match': '"not-the-real-etag"' }
+		});
+		expect(res.status).toBe(200);
+	});
+
+	test('a Range end beyond size - 1 is clamped to a 206, not rejected with 416', async () => {
+		const on_disk = readFileSync(join(fixture, 'static/favicon.png'));
+		const res = await fetch(`${base_url}/favicon.png`, {
+			headers: { range: `bytes=0-${on_disk.byteLength * 2}` }
+		});
+		expect(res.status).toBe(206);
+		expect(res.headers.get('content-range')).toBe(
+			`bytes 0-${on_disk.byteLength - 1}/${on_disk.byteLength}`
+		);
+	});
+
+	test('a suffix Range (bytes=-N) returns the last N bytes', async () => {
+		const on_disk = readFileSync(join(fixture, 'static/favicon.png'));
+		const res = await fetch(`${base_url}/favicon.png`, { headers: { range: 'bytes=-10' } });
+		expect(res.status).toBe(206);
+		expect(res.headers.get('content-range')).toBe(
+			`bytes ${on_disk.byteLength - 10}-${on_disk.byteLength - 1}/${on_disk.byteLength}`
+		);
+		const bytes = new Uint8Array(await res.arrayBuffer());
+		expect(Buffer.from(bytes).equals(on_disk.subarray(on_disk.byteLength - 10))).toBe(true);
+	});
+
+	test('a stale If-Range returns the full response instead of the requested range', async () => {
+		const on_disk = readFileSync(join(fixture, 'static/favicon.png'));
+		const res = await fetch(`${base_url}/favicon.png`, {
+			headers: { range: 'bytes=0-9', 'if-range': '"stale-etag"' }
+		});
+		expect(res.status).toBe(200);
+		expect(res.headers.get('content-length')).toBe(String(on_disk.byteLength));
+	});
+
+	test('a matching If-Range honours the Range request', async () => {
+		const first = await fetch(`${base_url}/favicon.png`);
+		await first.arrayBuffer();
+		const etag = first.headers.get('etag')!;
+
+		const res = await fetch(`${base_url}/favicon.png`, {
+			headers: { range: 'bytes=0-9', 'if-range': etag }
+		});
+		expect(res.status).toBe(206);
+	});
+
+	test('`/docs` and `/docs/` resolve to static/docs.html', async () => {
+		for (const path of ['/docs', '/docs/']) {
+			const res = await fetch(`${base_url}${path}`);
+			expect(res.status, path).toBe(200);
+			expect(await res.text()).toContain('Docs');
+		}
+	});
+
+	test('`/guide` and `/guide/` resolve to static/guide/index.html when there is no guide.html', async () => {
+		for (const path of ['/guide', '/guide/']) {
+			const res = await fetch(`${base_url}${path}`);
+			expect(res.status, path).toBe(200);
+			expect(await res.text()).toContain('Guide index');
+		}
+	});
+
+	test('`both.html` claims the clean-URL alias over `both/index.html`', async () => {
+		const res = await fetch(`${base_url}/both`);
+		expect(res.status).toBe(200);
+		expect(await res.text()).toContain('both.html wins');
+	});
+});
+
+// The default build has `precompress: true` (the default), so this fixture's own
+// compressible static assets (extra.css, hello.txt) exercise real Accept-Encoding
+// negotiation end to end. `precompress: false` is covered by base-path.spec.ts,
+// which reuses its own build rather than compiling a dedicated one here.
+describe('precompression (Accept-Encoding negotiation)', () => {
+	test('br-negotiated /extra.css decompresses to the on-disk bytes', async () => {
+		const on_disk = readFileSync(join(fixture, 'static/extra.css'));
+		const res = await raw_request(`${base_url}/extra.css`, { 'accept-encoding': 'br' });
+
+		expect(res.status).toBe(200);
+		expect(res.headers['content-encoding']).toBe('br');
+		expect(res.headers['vary']).toBe('Accept-Encoding');
+		expect(res.headers['etag']).toMatch(/^"[\w-]+\.br"$/);
+		expect(brotliDecompressSync(res.body).equals(on_disk)).toBe(true);
+	});
+
+	test('gzip-negotiated /hello.txt decompresses to the on-disk bytes', async () => {
+		const on_disk = readFileSync(join(fixture, 'static/hello.txt'));
+		const res = await raw_request(`${base_url}/hello.txt`, { 'accept-encoding': 'gzip' });
+
+		expect(res.status).toBe(200);
+		expect(res.headers['content-encoding']).toBe('gzip');
+		expect(res.headers['etag']).toMatch(/^"[\w-]+\.gz"$/);
+		expect(gunzipSync(res.body).equals(on_disk)).toBe(true);
+	});
+
+	test('br is preferred over gzip when both are acceptable', async () => {
+		const res = await raw_request(`${base_url}/extra.css`, { 'accept-encoding': 'gzip, br' });
+		expect(res.headers['content-encoding']).toBe('br');
+	});
+
+	test('no Accept-Encoding header serves the identity representation, still advertising Vary', async () => {
+		const on_disk = readFileSync(join(fixture, 'static/extra.css'));
+		const res = await raw_request(`${base_url}/extra.css`, {});
+
+		expect(res.status).toBe(200);
+		expect(res.headers['content-encoding']).toBeUndefined();
+		expect(res.headers['vary']).toBe('Accept-Encoding');
+		expect(res.body.equals(on_disk)).toBe(true);
+	});
+
+	test('favicon.png is not a compressible extension, so it is never negotiated', async () => {
+		const res = await raw_request(`${base_url}/favicon.png`, { 'accept-encoding': 'br, gzip' });
+
+		expect(res.status).toBe(200);
+		expect(res.headers['content-encoding']).toBeUndefined();
+		expect(res.headers['vary']).toBeUndefined();
 	});
 });

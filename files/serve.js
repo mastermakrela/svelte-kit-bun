@@ -1,3 +1,5 @@
+import { rmSync, statSync } from 'node:fs';
+
 // Bun.serve's documented ceiling for `idleTimeout`.
 const BUN_MAX_IDLE_TIMEOUT_S = 255;
 
@@ -11,6 +13,7 @@ const XFF = 'x-forwarded-for';
 export const SUPPORTED_ENV_VARS = new Set([
 	'HOST',
 	'PORT',
+	'SOCKET_PATH',
 	'XFF_DEPTH',
 	'ADDRESS_HEADER',
 	'PROTOCOL_HEADER',
@@ -31,10 +34,6 @@ export const UNSUPPORTED_ENV_VARS = new Map([
 	[
 		'IDLE_TIMEOUT',
 		"in adapter-node this shuts the process down after a period with no requests, which only applies under systemd socket activation — a feature adapter-bun doesn't implement. For Bun.serve's per-connection idle timeout use CONNECTION_IDLE_TIMEOUT"
-	],
-	[
-		'SOCKET_PATH',
-		'adapter-bun always listens on a TCP host/port; listening on a unix socket is not implemented'
 	],
 	[
 		'KEEP_ALIVE_TIMEOUT',
@@ -116,6 +115,8 @@ export function read_config(
 	return {
 		host: read_env('HOST', '0.0.0.0'),
 		port,
+		// when set, `start()` binds to this unix socket instead of host/port
+		socket_path: read_env('SOCKET_PATH', ''),
 		xff_depth,
 		address_header: read_env('ADDRESS_HEADER', '').toLowerCase(),
 		protocol_header: read_env('PROTOCOL_HEADER', '').toLowerCase(),
@@ -168,24 +169,185 @@ export function parse_timeout(value, env_name, max) {
 const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
 
 /**
+ * @typedef {Object} CompressedVariant
+ * @property {string} file  $bunfs path
+ * @property {number} size
+ */
+
+/**
+ * @typedef {Object} BuiltAsset
+ * @property {string} file  $bunfs path
+ * @property {number} size
+ * @property {string} etag  bare sha256/base64url content hash, computed at build time
+ * @property {CompressedVariant} [br]
+ * @property {CompressedVariant} [gz]
+ */
+
+/**
+ * @typedef {Object} Asset
+ * @property {string} file
+ * @property {number} size
+ * @property {string} etag
+ * @property {string} [type]
+ * @property {string} [cache_control]
+ * @property {CompressedVariant} [br]
+ * @property {CompressedVariant} [gz]
+ */
+
+/**
+ * Parse `Accept-Encoding` and pick the preferred variant that exists, mirroring
+ * upstream adapter-node's `negotiate`: q-values (default 1), `*` as a fallback
+ * weight, gzip preferred over br only when its q is strictly higher, and q=0
+ * refusing a coding outright.
+ *
+ * @param {string | null} header
+ * @param {{ br?: unknown, gz?: unknown }} asset
+ * @returns {'br' | 'gz' | undefined}
+ */
+export function negotiate(header, asset) {
+	if (!header || !(asset.br || asset.gz)) return undefined;
+
+	/** @type {Map<string, number>} */
+	const weights = new Map();
+
+	for (const part of header.toLowerCase().split(',')) {
+		const [coding, ...params] = part.split(';');
+		let weight = 1;
+
+		for (const param of params) {
+			const [name, value] = param.split('=');
+			if (name.trim() === 'q') weight = parseFloat(value) || 0;
+		}
+
+		weights.set(coding.trim(), weight);
+	}
+
+	/** @param {string} coding */
+	const weight = (coding) => weights.get(coding) ?? weights.get('*') ?? 0;
+
+	const br = asset.br ? weight('br') : 0;
+	const gzip = asset.gz ? weight('gzip') : 0;
+
+	if (gzip > br) return 'gz';
+	if (br > 0) return 'br';
+	return undefined;
+}
+
+/**
+ * Whether an `If-None-Match` (or `If-Range`, compared to a single etag) header
+ * value matches `etag`, using weak comparison — an exact match after stripping a
+ * leading `W/`, or the wildcard `*`. Mirrors upstream adapter-node's `etag_matches`.
+ *
+ * @param {string | null} header
+ * @param {string} etag  already quoted, e.g. `"abc123"`
+ * @returns {boolean}
+ */
+export function etag_matches(header, etag) {
+	if (!header) return false;
+	if (header.trim() === '*') return true;
+	return header.split(',').some((tag) => tag.trim().replace(/^W\//, '') === etag);
+}
+
+/**
+ * One lookup for every request, decided at boot: client assets — including the
+ * clean-URL aliases `create_asset_table` derives from `.html` files under
+ * `static/` (`/foo` and `/foo/` resolve to `foo.html`, or to `foo/index.html`
+ * when only that exists; an exact file key always wins over an alias, and when
+ * both forms exist `foo.html` claims the aliases because it sorts first) — plus
+ * prerendered assets, matched only at their exact path. Client assets win a key
+ * collision, mirroring upstream adapter-node's `create_file_map`. The
+ * non-canonical trailing-slash form of a prerendered path is handled separately
+ * in `fetch` (see the `prerendered` Set), not aliased here.
+ *
+ * @param {Object} opts
+ * @param {string} opts.app_path
+ * @param {Record<string, string>} opts.mime_types
+ * @param {Record<string, BuiltAsset>} opts.client_assets
+ * @param {Record<string, BuiltAsset>} opts.prerendered_assets
+ * @returns {Map<string, Asset>}
+ */
+export function create_file_map({ app_path, mime_types, client_assets, prerendered_assets }) {
+	// Only hashed build output gets the immutable cache header — not e.g. version.json.
+	const immutable_prefix = `/${app_path}/immutable/`;
+
+	/**
+	 * @param {string} key
+	 * @param {BuiltAsset} raw
+	 * @returns {Asset}
+	 */
+	const to_asset = (key, raw) => ({
+		...raw,
+		type: mime_type(key, mime_types),
+		cache_control: key.startsWith(immutable_prefix) ? IMMUTABLE_CACHE_CONTROL : undefined
+	});
+
+	/** @type {Map<string, Asset>} */
+	const files = new Map();
+
+	const client_keys = Object.keys(client_assets).sort();
+	for (const key of client_keys) files.set(key, to_asset(key, client_assets[key]));
+
+	for (const key of client_keys) {
+		if (!key.endsWith('.html')) continue;
+		const asset = /** @type {Asset} */ (files.get(key));
+
+		const is_index = key.endsWith('/index.html');
+		const with_slash = is_index ? key.slice(0, -'index.html'.length) : `${key.slice(0, -5)}/`;
+		if (!files.has(with_slash)) files.set(with_slash, asset);
+
+		const without_slash = with_slash.slice(0, -1);
+		if (without_slash && !files.has(without_slash)) files.set(without_slash, asset);
+	}
+
+	for (const [key, raw] of Object.entries(prerendered_assets)) {
+		if (!files.has(key)) files.set(key, to_asset(key, raw));
+	}
+
+	return files;
+}
+
+/**
+ * Remove a stale unix socket file before binding to it — `Bun.serve` refuses to
+ * listen over an existing path otherwise. Mirrors upstream adapter-node's own
+ * guard, including its limitation: a live socket's `size` also reports `0`
+ * (sockets have no content), so this can't actually distinguish "nothing is
+ * listening here" from "something is" — it only clears a plain empty file left
+ * behind by, say, an unclean shutdown. Anything else at the path (non-empty, or
+ * the stat call failing outright) is left alone; `Bun.serve` surfaces the
+ * resulting bind failure itself.
+ *
+ * @param {string} path
+ */
+export function remove_stale_socket(path) {
+	try {
+		if (statSync(path).size === 0) rmSync(path);
+	} catch {
+		// ignore: no file at path, or it's otherwise inaccessible
+	}
+}
+
+/**
  * Runtime for adapter-bun. Invoked from the codegen-emitted entry.js with the
- * Server class, manifest, and asset maps already resolved to $bunfs paths.
+ * SvelteKit server instance, build metadata, and asset maps already resolved to
+ * $bunfs paths.
  *
  * @param {Object} options
- * @param {new (manifest: import('@sveltejs/kit').SSRManifest) => import('@sveltejs/kit').Server} options.Server
- * @param {import('@sveltejs/kit').SSRManifest} options.manifest
+ * @param {import('@sveltejs/kit').Server} options.server
  * @param {Set<string>} options.prerendered
- * @param {Record<string, string>} options.client_assets      URL path -> $bunfs file path
- * @param {Record<string, string>} options.prerendered_assets URL path -> $bunfs file path
+ * @param {string} options.app_path   `builder.getAppPath()`, e.g. `_app` or `base/_app`
+ * @param {Record<string, string>} options.mime_types  `builder.mimeTypes`
+ * @param {Record<string, BuiltAsset>} options.client_assets      URL path -> build-time asset data
+ * @param {Record<string, BuiltAsset>} options.prerendered_assets URL path -> build-time asset data
  * @param {Record<string, string>} options.server_assets      manifest asset key -> $bunfs file path
- * @param {string} [options.origin]      `kit.paths.origin`, baked in at build time
+ * @param {string} [options.origin]      `paths.origin`, baked in at build time
  * @param {string} [options.env_prefix]
  * @returns {Promise<import('bun').Server<unknown>>}
  */
 export async function start({
-	Server,
-	manifest,
+	server,
 	prerendered,
+	app_path,
+	mime_types,
 	client_assets,
 	prerendered_assets,
 	server_assets,
@@ -197,6 +359,7 @@ export async function start({
 	const {
 		host,
 		port,
+		socket_path,
 		xff_depth,
 		address_header,
 		protocol_header,
@@ -207,111 +370,111 @@ export async function start({
 		shutdown_timeout
 	} = read_config(process.env, env_prefix);
 
-	const server = new Server(manifest);
-
 	await server.init({
 		env: /** @type {Record<string, string>} */ (process.env),
 		read: (file) => Bun.file(server_assets[file]).stream()
 	});
 
-	// Only hashed build output gets the immutable cache header — not e.g. version.json.
-	const immutable_prefix = `/${manifest.appPath}/immutable/`;
+	const files = create_file_map({ app_path, mime_types, client_assets, prerendered_assets });
+	/** @type {Map<string, (request: Request) => Response>} */
+	const static_handlers = new Map();
+	for (const [key, asset] of files) static_handlers.set(key, make_asset_handler(asset));
 
-	// Prerendered overrides client on key overlap.
-	/** @type {Record<string, (request: Request) => Response>} */
-	const routes = {};
-	for (const [url_path, bunfs_path] of Object.entries(client_assets)) {
-		routes[url_path] = make_asset_handler(bunfs_path, {
-			type: mime_type(url_path, manifest.mimeTypes),
-			cache_control: url_path.startsWith(immutable_prefix) ? IMMUTABLE_CACHE_CONTROL : undefined
-		});
-	}
-	for (const [url_path, bunfs_path] of Object.entries(prerendered_assets)) {
-		routes[url_path] = make_asset_handler(bunfs_path, {
-			type: mime_type(url_path, manifest.mimeTypes)
-		});
-	}
+	/** @type {(request: Request, srv: import('bun').Server<unknown>) => Promise<Response>} */
+	const fetch = async (request, srv) => {
+		try {
+			const url = new URL(request.url);
+			const pathname = decode_pathname(url.pathname);
 
-	const bun_server = Bun.serve({
-		hostname: host,
-		port,
-		routes,
-		maxRequestBodySize: body_size_limit,
-		idleTimeout: connection_idle_timeout,
-		fetch: async (request, srv) => {
+			// Static assets are a closed set decided at boot — served before origin
+			// resolution / SSR, same as upstream adapter-node's static middleware
+			// running ahead of the SvelteKit handler.
+			const static_handler = static_handlers.get(pathname);
+			if (static_handler) return static_handler(request);
+
+			let effective_origin;
 			try {
-				const url = new URL(request.url);
-
-				const effective_origin = resolve_origin(request, url, {
+				effective_origin = resolve_origin(request, url, {
 					origin,
 					protocol_header,
 					host_header,
 					port_header
 				});
-
-				let final_url = url;
-				let final_request = request;
-				if (effective_origin && `${url.protocol}//${url.host}` !== effective_origin) {
-					final_request = new Request(`${effective_origin}${url.pathname}${url.search}`, request);
-					final_url = new URL(final_request.url);
-				}
-
-				let pathname = final_url.pathname;
-				if (pathname.includes('%')) {
-					try {
-						pathname = decodeURIComponent(pathname);
-					} catch (err) {
-						process.stderr.write(`adapter-bun: failed to decode pathname '${pathname}': ${err}\n`);
-					}
-				}
-
-				if (!prerendered.has(pathname)) {
-					// remove or add trailing slash as appropriate
-					const inverted = pathname.at(-1) === '/' ? pathname.slice(0, -1) : pathname + '/';
-					if (prerendered.has(inverted)) {
-						// a *relative* location survives a proxy that strips a mount prefix
-						const location = relative_pathname(pathname, inverted) + final_url.search;
-						return new Response(null, { status: 308, headers: { location } });
-					}
-				}
-
-				const response = await server.respond(final_request, {
-					platform: { server: srv },
-					getClientAddress: () =>
-						get_client_address(request, srv, address_header, xff_depth, env_prefix)
-				});
-
-				// Reverse proxies such as nginx buffer responses by default (ignoring
-				// `cache-control`), which breaks streaming responses like server-sent events.
-				// `X-Accel-Buffering: no` opts out of that buffering and is a no-op on proxies
-				// that don't recognise it. See https://github.com/sveltejs/kit/issues/15790
-				if (response.headers.get('content-type') === 'text/event-stream') {
-					response.headers.set('x-accel-buffering', 'no');
-
-					// A server-sent-events stream may stay quiet for longer than
-					// `CONNECTION_IDLE_TIMEOUT` (SvelteKit's `query.live`, for instance,
-					// only sends a keep-alive comment every 30s), which would have Bun
-					// close the connection mid-response. Opt this connection out.
-					if (connection_idle_timeout > 0) srv.timeout(request, 0);
-				}
-
-				return response;
 			} catch (err) {
-				process.stderr.write(
-					`adapter-bun: unhandled error for ${request.method} ${request.url}: ${
-						err instanceof Error ? (err.stack ?? err.message) : err
-					}\n`
-				);
-				return new Response('Internal Server Error', { status: 500 });
+				const message = err instanceof Error ? err.message : String(err);
+				process.stderr.write(`adapter-bun: Could not determine request origin: ${message}\n`);
+				return new Response('Bad Request', { status: 400 });
 			}
+
+			let final_url = url;
+			let final_request = request;
+			if (`${url.protocol}//${url.host}` !== effective_origin) {
+				final_request = new Request(`${effective_origin}${url.pathname}${url.search}`, request);
+				final_url = new URL(final_request.url);
+			}
+
+			// `pathname` is unaffected by the origin swap above — only the
+			// protocol/host of `final_url` differ from `url`.
+			if (!prerendered.has(pathname)) {
+				// remove or add trailing slash as appropriate
+				const inverted = pathname.at(-1) === '/' ? pathname.slice(0, -1) : pathname + '/';
+				if (prerendered.has(inverted)) {
+					// a *relative* location survives a proxy that strips a mount prefix
+					const location = relative_pathname(pathname, inverted) + final_url.search;
+					return new Response(null, { status: 308, headers: { location } });
+				}
+			}
+
+			const response = await server.respond(final_request, {
+				platform: { server: srv },
+				getClientAddress: () =>
+					get_client_address(request, srv, address_header, xff_depth, env_prefix)
+			});
+
+			// Reverse proxies such as nginx buffer responses by default (ignoring
+			// `cache-control`), which breaks streaming responses like server-sent events.
+			// `X-Accel-Buffering: no` opts out of that buffering and is a no-op on proxies
+			// that don't recognise it. See https://github.com/sveltejs/kit/issues/15790
+			if (response.headers.get('content-type') === 'text/event-stream') {
+				response.headers.set('x-accel-buffering', 'no');
+
+				// A server-sent-events stream may stay quiet for longer than
+				// `CONNECTION_IDLE_TIMEOUT` (SvelteKit's `query.live`, for instance,
+				// only sends a keep-alive comment every 30s), which would have Bun
+				// close the connection mid-response. Opt this connection out.
+				if (connection_idle_timeout > 0) srv.timeout(request, 0);
+			}
+
+			return response;
+		} catch (err) {
+			process.stderr.write(
+				`adapter-bun: unhandled error for ${request.method} ${request.url}: ${
+					err instanceof Error ? (err.stack ?? err.message) : err
+				}\n`
+			);
+			return new Response('Internal Server Error', { status: 500 });
 		}
+	};
+
+	// Bun's types forbid `idleTimeout` next to `unix`, but the runtime honours it there
+	// too (Bun 1.4.2: the 10s default cuts a quiet unix-socket request as well), so
+	// dropping it would silently bring that default back for `SOCKET_PATH`.
+	/** @type {Record<string, unknown>} */
+	const listen = socket_path ? { unix: socket_path } : { hostname: host, port };
+	if (socket_path) remove_stale_socket(socket_path);
+	const bun_server = Bun.serve({
+		...listen,
+		maxRequestBodySize: body_size_limit,
+		idleTimeout: connection_idle_timeout,
+		fetch
 	});
 
-	process.stderr.write(`Listening on http://${host}:${port}\n`);
+	process.stderr.write(`Listening on ${socket_path || `http://${host}:${port}`}\n`);
 
 	await new Promise((resolve) => {
 		let stopping = false;
-		const stop = async () => {
+		/** @param {'SIGTERM' | 'SIGINT'} signal */
+		const stop = async (signal) => {
 			if (stopping) return;
 			stopping = true;
 			process.removeListener('SIGTERM', stop);
@@ -330,6 +493,12 @@ export async function start({
 			} catch (err) {
 				process.stderr.write(`adapter-bun: error during shutdown: ${err}\n`);
 			}
+			// Mirrors upstream adapter-node: emitted once, after the server has
+			// stopped accepting connections (gracefully or forced after
+			// SHUTDOWN_TIMEOUT), so app code can use it to clean up — e.g. closing a
+			// database connection. Upstream also emits this for its 'IDLE' reason
+			// under systemd socket activation, which this adapter doesn't implement.
+			process.emit('sveltekit:shutdown', signal);
 			resolve(undefined);
 		};
 		process.on('SIGTERM', stop);
@@ -340,17 +509,44 @@ export async function start({
 }
 
 /**
- * Resolve the origin the browser is seeing: the build-time `kit.paths.origin` if
- * configured, otherwise derived from the request and env-configured proxy headers.
+ * Reject a proxy header (protocol/host/port) that carries more than one value, mirroring
+ * upstream adapter-node's `normalise_header`. Node's `IncomingHttpHeaders` can hand back
+ * an array for a repeated header; Bun's `Headers.get()` already joins repeats with `, ` so
+ * there is no array form to check here — a comma inside one of these single-valued headers
+ * is therefore treated as "multiple values" and rejected the same way. This does NOT apply
+ * to `ADDRESS_HEADER`, which is legitimately comma-separated when it's `x-forwarded-for`
+ * (see `get_client_address`).
+ *
+ * @param {string} name    lowercased header name, for the error message
+ * @param {string | null} value
+ * @returns {string | undefined}
+ */
+function normalise_header(name, value) {
+	if (value === null) return undefined;
+	if (value.includes(',')) {
+		throw new Error(
+			`Multiple values provided for ${name} header where only one expected: ${value}`
+		);
+	}
+	return value;
+}
+
+/**
+ * Resolve the origin the browser is seeing: the build-time `paths.origin` if configured,
+ * otherwise always derived from the request, corrected by whichever proxy headers are
+ * configured. Mirrors upstream adapter-node's `get_origin`, including defaulting the
+ * protocol to `https` when `PROTOCOL_HEADER` is unset or absent from the request — an
+ * unconfigured deployment is assumed to sit behind a TLS-terminating proxy rather than
+ * assumed to be plain `http`.
  *
  * @param {Request} request
  * @param {URL} url
  * @param {Object} cfg
- * @param {string} [cfg.origin]          `kit.paths.origin`, baked in at build time
+ * @param {string} [cfg.origin]          `paths.origin`, baked in at build time
  * @param {string} cfg.protocol_header   lowercased, '' to disable
  * @param {string} cfg.host_header       lowercased, '' to disable
  * @param {string} cfg.port_header       lowercased, '' to disable
- * @returns {string | undefined}
+ * @returns {string}
  */
 export function resolve_origin(
 	request,
@@ -358,29 +554,35 @@ export function resolve_origin(
 	{ origin, protocol_header, host_header, port_header }
 ) {
 	if (origin) return origin;
-	if (!protocol_header && !host_header && !port_header) return undefined;
 
 	const headers = request.headers;
 
-	let protocol = url.protocol.slice(0, -1);
-	if (protocol_header) {
-		const value = headers.get(protocol_header);
-		if (value) {
-			// prevent host-injection through the protocol header (RFC 7230 §5.5)
-			if (value.includes(':')) {
-				throw new Error(
-					`The ${protocol_header} header specified '${value}' which is invalid because it includes \`:\`. It should only contain the protocol scheme (e.g. \`https\`)`
-				);
-			}
-			protocol = value;
-		}
+	const raw_protocol = protocol_header
+		? normalise_header(protocol_header, headers.get(protocol_header))
+		: undefined;
+	const protocol = decodeURIComponent(raw_protocol || 'https');
+	// prevent host-injection through the protocol header (RFC 7230 §5.5)
+	if (protocol.includes(':')) {
+		throw new Error(
+			`The ${protocol_header} header specified '${protocol}' which is invalid because it includes \`:\`. It should only contain the protocol scheme (e.g. \`https\`)`
+		);
 	}
 
-	const hostname = host_header ? headers.get(host_header) || url.hostname : url.hostname;
+	// `url.host` (not `url.hostname`) so the fallback carries a non-default port, same
+	// as upstream falling back to the raw `host` header (which is `hostname[:port]`).
+	const host = host_header
+		? normalise_header(host_header, headers.get(host_header)) || url.host
+		: url.host;
+	if (!host) {
+		const header_names = host_header ? `${host_header} or host` : 'host';
+		throw new Error(
+			`Could not determine host. The request must have a value provided by the ${header_names} header`
+		);
+	}
 
 	let port = '';
 	if (port_header) {
-		const value = headers.get(port_header);
+		const value = normalise_header(port_header, headers.get(port_header));
 		if (value) {
 			if (Number.isNaN(Number(value))) {
 				throw new Error(
@@ -391,7 +593,30 @@ export function resolve_origin(
 		}
 	}
 
-	return port ? `${protocol}://${hostname}:${port}` : `${protocol}://${hostname}`;
+	return port ? `${protocol}://${host}:${port}` : `${protocol}://${host}`;
+}
+
+/**
+ * Decode a request pathname the way SvelteKit's router does: split on the literal `%25`
+ * (a percent-encoded `%`) and `decodeURI` each piece separately, rather than decoding the
+ * whole pathname in one pass. That keeps reserved characters like `%2F` encoded (`decodeURI`
+ * already leaves them alone), and — because the split removes every `%25` *before*
+ * `decodeURI` runs — a literal `%25` in the path stays `%25` instead of `decodeURI` turning
+ * it into a bare `%`, while any other `%XX` escape in the surrounding pieces still decodes
+ * normally. Mirrors `decode_pathname` in `@sveltejs/kit/src/utils/url.js` and upstream
+ * adapter-node's `static.js#split_url`. A malformed `%` escape is left undecoded, same as
+ * upstream.
+ *
+ * @param {string} pathname
+ * @returns {string}
+ */
+export function decode_pathname(pathname) {
+	if (!pathname.includes('%')) return pathname;
+	try {
+		return pathname.split('%25').map(decodeURI).join('%25');
+	} catch {
+		return pathname;
+	}
 }
 
 /**
@@ -401,7 +626,7 @@ export function resolve_origin(
  * in which case `Bun.file(...).type` is used as the fallback.
  *
  * @param {string} url_path
- * @param {Record<string, string> | undefined} mime_types  `manifest.mimeTypes`
+ * @param {Record<string, string>} mime_types  `builder.mimeTypes`
  * @returns {string | undefined}
  */
 export function mime_type(url_path, mime_types) {
@@ -409,7 +634,7 @@ export function mime_type(url_path, mime_types) {
 	const dot = filename.lastIndexOf('.');
 	if (dot === -1) return undefined;
 
-	const type = mime_types?.[filename.slice(dot)];
+	const type = mime_types[filename.slice(dot)];
 	if (!type) return undefined;
 
 	return type === 'text/html' ? 'text/html;charset=utf-8' : type;
@@ -485,72 +710,119 @@ export function parse_as_bytes(value, env_name) {
 }
 
 /**
- * Per-asset handler: GET, HEAD, OPTIONS, plus `Range: bytes=start-end` (206). Other methods → 405.
+ * Handler for one static asset: GET/HEAD only (every other method, including
+ * OPTIONS, gets 405), conditional requests via `ETag`/`If-None-Match`, and
+ * `Range` requests exactly like upstream adapter-node's `serve_static` — `end`
+ * beyond `size - 1` is clamped rather than rejected, `bytes=-N` is a suffix
+ * range, an unbounded `bytes=` (neither bound given) is ignored and falls
+ * through to a full response, and a stale `If-Range` validator gets the whole
+ * current representation instead of the requested slice. When precompressed
+ * variants (`br`/`gz`) are present, `Accept-Encoding` is negotiated per request
+ * (mirroring upstream's `serve_static`): the chosen variant swaps in its own
+ * file/size/etag (`"<hash>.<variant>"`) before any of the above logic runs, and
+ * `Vary: Accept-Encoding` is added whenever a variant could have been chosen.
  *
- * @param {string} bunfs_path
- * @param {Object} [options]
- * @param {string} [options.type]           content type; defaults to Bun's extension mapping
- * @param {string} [options.cache_control]  `cache-control` header, if any
+ * @param {Asset} asset
  * @returns {(request: Request) => Response}
  */
-export function make_asset_handler(bunfs_path, { type: mime, cache_control } = {}) {
+export function make_asset_handler({
+	file: bunfs_path,
+	size,
+	type,
+	cache_control,
+	etag: hash,
+	br,
+	gz
+}) {
 	const file = Bun.file(bunfs_path);
-	const type = mime ?? file.type;
-	const size = file.size;
-	/** @type {Record<string, string>} */
-	const extra_headers = cache_control ? { 'cache-control': cache_control } : {};
+	const content_type = type ?? file.type;
+	const etag = `"${hash}"`;
+	const has_variants = Boolean(br || gz);
+	const br_file = br ? Bun.file(br.file) : undefined;
+	const gz_file = gz ? Bun.file(gz.file) : undefined;
 
 	return (request) => {
 		const method = request.method;
 
-		if (method === 'OPTIONS') {
-			return new Response(null, {
-				status: 204,
-				headers: { allow: 'GET, HEAD, OPTIONS' }
-			});
-		}
-
 		if (method !== 'GET' && method !== 'HEAD') {
-			return new Response(null, {
-				status: 405,
-				headers: { allow: 'GET, HEAD, OPTIONS' }
-			});
+			return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } });
 		}
 
-		const range = request.headers.get('range');
-		if (range) {
-			const match = /^bytes=(\d+)-(\d*)$/.exec(range);
-			if (match) {
-				const start = Number(match[1]);
-				const end = match[2] ? Number(match[2]) : size - 1;
-				if (start <= end && end < size) {
-					const body = method === 'HEAD' ? null : file.slice(start, end + 1);
-					return new Response(body, {
-						status: 206,
-						headers: {
-							...extra_headers,
-							'content-type': type,
-							'content-range': `bytes ${start}-${end}/${size}`,
-							'content-length': String(end - start + 1),
-							'accept-ranges': 'bytes'
-						}
+		// negotiate before anything else: the chosen variant's file/size/etag drive
+		// every subsequent decision (304, range math, content-encoding)
+		let serve_file = file;
+		let serve_size = size;
+		let serve_etag = etag;
+		/** @type {string | undefined} */
+		let content_encoding;
+
+		if (has_variants) {
+			const variant = negotiate(request.headers.get('accept-encoding'), { br, gz });
+			if (variant === 'br' && br && br_file) {
+				serve_file = br_file;
+				serve_size = br.size;
+				serve_etag = `"${hash}.br"`;
+				content_encoding = 'br';
+			} else if (variant === 'gz' && gz && gz_file) {
+				serve_file = gz_file;
+				serve_size = gz.size;
+				serve_etag = `"${hash}.gz"`;
+				content_encoding = 'gzip';
+			}
+		}
+
+		/** @type {Record<string, string>} */
+		const base_headers = { etag: serve_etag };
+		if (has_variants) base_headers.vary = 'Accept-Encoding';
+		if (cache_control) base_headers['cache-control'] = cache_control;
+
+		if (etag_matches(request.headers.get('if-none-match'), serve_etag)) {
+			return new Response(null, { status: 304, headers: base_headers });
+		}
+
+		/** @type {Record<string, string>} */
+		const headers = {
+			...base_headers,
+			'content-length': String(serve_size),
+			'accept-ranges': 'bytes'
+		};
+		if (content_type) headers['content-type'] = content_type;
+		if (content_encoding) headers['content-encoding'] = content_encoding;
+
+		const range_header = request.headers.get('range');
+		// a stale `If-Range` validator means the client's partial copy is of an older
+		// representation, so it gets the whole current one instead of a range
+		const if_range = request.headers.get('if-range');
+		if (range_header && (!if_range || if_range === serve_etag)) {
+			const match = /^bytes=(\d*)-(\d*)$/.exec(range_header);
+
+			if (match && (match[1] || match[2])) {
+				let start = match[1] ? Number(match[1]) : NaN;
+				let end = match[2] ? Number(match[2]) : serve_size - 1;
+
+				if (Number.isNaN(start)) {
+					// suffix range: the last `end` bytes
+					start = Math.max(serve_size - end, 0);
+					end = serve_size - 1;
+				} else {
+					end = Math.min(end, serve_size - 1);
+				}
+
+				if (start >= serve_size || start > end) {
+					return new Response(null, {
+						status: 416,
+						headers: { 'content-range': `bytes */${serve_size}` }
 					});
 				}
+
+				headers['content-range'] = `bytes ${start}-${end}/${serve_size}`;
+				headers['content-length'] = String(end - start + 1);
+				const body = method === 'HEAD' ? null : serve_file.slice(start, end + 1);
+				return new Response(body, { status: 206, headers });
 			}
-			return new Response(null, {
-				status: 416,
-				headers: { 'content-range': `bytes */${size}` }
-			});
 		}
 
-		const body = method === 'HEAD' ? null : file;
-		return new Response(body, {
-			headers: {
-				...extra_headers,
-				'content-type': type,
-				'content-length': String(size),
-				'accept-ranges': 'bytes'
-			}
-		});
+		const body = method === 'HEAD' ? null : serve_file;
+		return new Response(body, { headers });
 	};
 }

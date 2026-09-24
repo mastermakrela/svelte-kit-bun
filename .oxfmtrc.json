@@ -1,0 +1,27 @@
+{
+	"$schema": "./node_modules/oxfmt/configuration_schema.json",
+	"useTabs": true,
+	"singleQuote": true,
+	"trailingComma": "none",
+	"printWidth": 100,
+	"sortPackageJson": false,
+	"svelte": {},
+	"overrides": [
+		{
+			"files": ["README.md"],
+			"options": {
+				"useTabs": false,
+				"tabWidth": 2
+			}
+		}
+	],
+	"ignorePatterns": [
+		"**/node_modules",
+		"**/.svelte-kit",
+		"tests/fixtures/*/build",
+		"tests/fixtures/*/build-*",
+		"coverage",
+		"bun.lock",
+		"PAPERCUTS.md"
+	]
+}
