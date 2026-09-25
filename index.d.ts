@@ -1,7 +1,7 @@
 import { Adapter } from '@sveltejs/kit';
 import './ambient.js';
 
-interface AdapterOptions {
+export interface AdapterOptions {
 	/**
 	 * Output directory for the compiled executable and intermediate files.
 	 * @default 'build'
@@ -19,6 +19,19 @@ interface AdapterOptions {
 	compile?: boolean;
 
 	/**
+	 * Whether to compress client and prerendered assets with gzip and brotli at
+	 * build time (mirroring `@sveltejs/adapter-node`'s `precompress` option) and
+	 * embed both variants in the executable alongside the original, so the
+	 * runtime can negotiate `Accept-Encoding` per request.
+	 *
+	 * **Trade-off:** each compressible asset is then embedded up to 3× (raw +
+	 * gzip + brotli), which grows the executable. Set this to `false` for a
+	 * smaller binary — the server then always sends uncompressed bodies.
+	 * @default true
+	 */
+	precompress?: boolean;
+
+	/**
 	 * Name of the output executable (without platform-specific extension).
 	 * Ignored when `compile` is `false`.
 	 * @default 'app'
@@ -26,8 +39,14 @@ interface AdapterOptions {
 	binaryName?: string;
 
 	/**
-	 * Prefix for SvelteKit-specific environment variables. Useful when running
-	 * alongside other processes that use conflicting variable names.
+	 * Prefix for the runtime environment variables (`HOST`, `PORT`,
+	 * `CONNECTION_IDLE_TIMEOUT`, …). Useful when running alongside other
+	 * processes that use conflicting variable names.
+	 *
+	 * When set, the built app refuses to start if any *other* variable carries
+	 * the prefix — that normally means the prefix collides with something else
+	 * in the environment. See the README for the full list of supported
+	 * variables.
 	 * @default ''
 	 */
 	envPrefix?: string;

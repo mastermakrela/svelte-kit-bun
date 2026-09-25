@@ -1,5 +1,5 @@
 import { read } from '$app/server';
-import greetingAsset from '$lib/greeting.txt';
+import greetingAsset from '#lib/greeting.txt';
 
 export const GET = () =>
 	new Response(read(greetingAsset).body, {

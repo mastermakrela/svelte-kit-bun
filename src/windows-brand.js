@@ -5,12 +5,16 @@ const IMAGE_DIRECTORY_ENTRY_BASE_RELOCATION = 5;
 const IMAGE_SUBSYSTEM_WINDOWS_GUI = 2;
 
 /**
- * `bun build --compile` appends a small `.bun` marker section after `.reloc`,
- * followed by the actual embedded-asset payload as a raw, section-table-less
- * overlay running to EOF. `pe-library`'s `NtExecutableResource.from` refuses
- * to touch the resource section whenever anything other than `.reloc` follows
- * it, because rewriting resources shifts everything after them and it only
- * knows how to re-home `.reloc` automatically.
+ * `bun build --compile` appends a `.bun` section after `.reloc` holding the
+ * embedded payload. Depending on the Bun version and the payload, raw
+ * section-table-less overlay bytes may also follow it to EOF (seen with small
+ * payloads on Bun 1.3; Bun 1.4 writes none). Either way `.bun` is the only
+ * section after `.reloc`, so the same handling applies to both.
+ *
+ * `pe-library`'s `NtExecutableResource.from` refuses to touch the resource
+ * section whenever anything other than `.reloc` follows it, because rewriting
+ * resources shifts everything after them and it only knows how to re-home
+ * `.reloc` automatically.
  *
  * The underlying `NtExecutable` class is not actually limited that way — it
  * repositions every section generically and re-appends trailing "extra data"
@@ -41,7 +45,7 @@ export function hide_bun_marker_section(exe) {
 	if (unrecognized.length > 0) {
 		throw new Error(
 			'@sveltejs/adapter-bun: unrecognized section(s) after the resource section ' +
-				`(${unrecognized.map((s) => s.info.name).join(', ')}). This adapter\'s Windows ` +
+				`(${unrecognized.map((s) => s.info.name).join(', ')}). This adapter's Windows ` +
 				'icon/metadata post-processing only knows how to handle the `.bun` marker section ' +
 				"from the Bun version it was verified against — the compiled executable's layout " +
 				'has changed in a way this adapter does not understand. Please file an issue.'
@@ -79,7 +83,7 @@ function parse_version(version) {
 }
 
 /**
- * @typedef {NonNullable<NonNullable<Parameters<import('../index.js').default>[0]>['windows']>} WindowsOptions
+ * @typedef {NonNullable<import('../index.js').AdapterOptions['windows']>} WindowsOptions
  */
 
 /**
@@ -136,7 +140,9 @@ export function apply_windows_branding(exe_bytes, windows, icon_bytes) {
 
 		const existing_version_infos = Resource.VersionInfo.fromEntries(rsrc.entries);
 		const version_infos =
-			existing_version_infos.length > 0 ? existing_version_infos : [Resource.VersionInfo.createEmpty()];
+			existing_version_infos.length > 0
+				? existing_version_infos
+				: [Resource.VersionInfo.createEmpty()];
 
 		for (const version_info of version_infos) {
 			const langs = version_info.getAvailableLanguages();

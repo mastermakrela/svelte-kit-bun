@@ -1,0 +1,6 @@
+# `bun test` cannot run this suite: the specs are Vitest specs and use `vi.stubGlobal`,
+# `vi.mock` and `vi.mocked`, which Bun's built-in test runner does not implement. Without
+# this preload `bun test` picks up `tests/**/*.spec.ts` and reports dozens of unrelated
+# failures; with it you get one actionable message instead.
+[test]
+preload = ["./tests/bun-test-guard.ts"]

@@ -5,11 +5,11 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { NtExecutable, NtExecutableResource, Resource } from 'resedit';
-import { apply_windows_branding, hide_bun_marker_section } from '../src/windows-brand.js';
+import { apply_windows_branding, hide_bun_marker_section } from '../../src/windows-brand.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const fixture_entry = join(__dirname, 'fixtures/windows-branding/entry.js');
-const icon_path = join(__dirname, 'fixtures/windows-branding/icon.ico');
+const fixture_entry = join(__dirname, '../fixtures/windows-branding/entry.js');
+const icon_path = join(__dirname, '../fixtures/windows-branding/icon.ico');
 
 /**
  * `Buffer#buffer` is a view into Node's underlying `ArrayBuffer`, which for
@@ -42,7 +42,9 @@ describe('apply_windows_branding against a real cross-compiled executable', () =
 			{ stdio: 'inherit' }
 		);
 		if (build.status !== 0) {
-			throw new Error(`bun build --compile --target=bun-windows-x64 failed (status ${build.status})`);
+			throw new Error(
+				`bun build --compile --target=bun-windows-x64 failed (status ${build.status})`
+			);
 		}
 		original_bytes = to_array_buffer(readFileSync(outfile));
 	}, 60_000);
@@ -99,13 +101,10 @@ describe('apply_windows_branding against a real cross-compiled executable', () =
 		expect(patched_bun).toBeDefined();
 		expect(Buffer.from(patched_bun!.data!).equals(Buffer.from(original_bun!.data!))).toBe(true);
 
-		// the embedded payload trailing `.bun` (Bun's actual asset/module blob)
-		// must also survive byte-for-byte, just re-appended after the relocated section.
-		const original_extra = original_exe.getExtraData();
-		const patched_extra = patched_exe.getExtraData();
-		expect(original_extra).not.toBeNull();
-		expect(patched_extra).not.toBeNull();
-		expect(Buffer.from(patched_extra!).equals(Buffer.from(original_extra!))).toBe(true);
+		// whether Bun writes trailing "extra data" after `.bun` depends on the Bun
+		// version and payload (Bun 1.3 does for this small fixture, Bun 1.4 doesn't);
+		// whatever trails the sections must survive byte-for-byte.
+		expect_same_extra_data(patched_exe, original_exe);
 	});
 
 	test('is a no-op on the `.bun` marker + payload when no windows options are given', () => {
@@ -113,8 +112,17 @@ describe('apply_windows_branding against a real cross-compiled executable', () =
 		const patched_exe = NtExecutable.from(patched, { ignoreCert: true });
 		const original_exe = NtExecutable.from(original_bytes, { ignoreCert: true });
 
-		expect(Buffer.from(patched_exe.getExtraData()!).equals(Buffer.from(original_exe.getExtraData()!))).toBe(
-			true
-		);
+		expect_same_extra_data(patched_exe, original_exe);
 	});
 });
+
+function expect_same_extra_data(actual: NtExecutable, expected: NtExecutable) {
+	const actual_extra = actual.getExtraData();
+	const expected_extra = expected.getExtraData();
+	if (expected_extra === null) {
+		expect(actual_extra).toBeNull();
+		return;
+	}
+	expect(actual_extra).not.toBeNull();
+	expect(Buffer.from(actual_extra!).equals(Buffer.from(expected_extra))).toBe(true);
+}
