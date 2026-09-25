@@ -26,7 +26,7 @@ SvelteKit 3 takes its configuration inline in the `sveltekit()` Vite plugin (the
 
 ```js
 // vite.config.js
-import adapter from '@sveltejs/adapter-bun';
+import adapter from 'svelte-kit-bun';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
