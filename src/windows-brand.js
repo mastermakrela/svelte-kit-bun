@@ -5,12 +5,16 @@ const IMAGE_DIRECTORY_ENTRY_BASE_RELOCATION = 5;
 const IMAGE_SUBSYSTEM_WINDOWS_GUI = 2;
 
 /**
- * `bun build --compile` appends a small `.bun` marker section after `.reloc`,
- * followed by the actual embedded-asset payload as a raw, section-table-less
- * overlay running to EOF. `pe-library`'s `NtExecutableResource.from` refuses
- * to touch the resource section whenever anything other than `.reloc` follows
- * it, because rewriting resources shifts everything after them and it only
- * knows how to re-home `.reloc` automatically.
+ * `bun build --compile` appends a `.bun` section after `.reloc` holding the
+ * embedded payload. Depending on the Bun version and the payload, raw
+ * section-table-less overlay bytes may also follow it to EOF (seen with small
+ * payloads on Bun 1.3; Bun 1.4 writes none). Either way `.bun` is the only
+ * section after `.reloc`, so the same handling applies to both.
+ *
+ * `pe-library`'s `NtExecutableResource.from` refuses to touch the resource
+ * section whenever anything other than `.reloc` follows it, because rewriting
+ * resources shifts everything after them and it only knows how to re-home
+ * `.reloc` automatically.
  *
  * The underlying `NtExecutable` class is not actually limited that way — it
  * repositions every section generically and re-appends trailing "extra data"

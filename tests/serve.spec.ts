@@ -4,7 +4,8 @@ import {
 	make_asset_handler,
 	parse_as_bytes,
 	parse_origin,
-	resolve_origin
+	resolve_origin,
+	validate_env
 } from '../files/serve.js';
 
 describe('parse_as_bytes', () => {
@@ -139,7 +140,7 @@ describe('resolve_origin', () => {
 		).toBe('https://example.com:8443');
 	});
 
-	test('falls back to url.hostname when host_header absent', () => {
+	test('falls back to url.host (keeping the port) when host_header absent', () => {
 		const req = make_request({ 'x-forwarded-proto': 'https' });
 		const url = new URL(req.url);
 		expect(
@@ -148,7 +149,39 @@ describe('resolve_origin', () => {
 				protocol_header: 'x-forwarded-proto',
 				host_header: 'x-forwarded-host'
 			})
-		).toBe('https://localhost');
+		).toBe('https://localhost:3000');
+	});
+
+	test('keeps the request protocol when protocol_header is configured but absent', () => {
+		const req = make_request({ 'x-forwarded-host': 'example.com' });
+		const url = new URL(req.url);
+		expect(
+			resolve_origin(req, url, {
+				...base_cfg,
+				protocol_header: 'x-forwarded-proto',
+				host_header: 'x-forwarded-host'
+			})
+		).toBe('http://example.com');
+	});
+
+	test('decodes a percent-encoded protocol header before the colon check', () => {
+		const req = make_request({ 'x-forwarded-proto': 'https%3A%2F%2Fevil.com' });
+		const url = new URL(req.url);
+		expect(() =>
+			resolve_origin(req, url, { ...base_cfg, protocol_header: 'x-forwarded-proto' })
+		).toThrow(/invalid because it includes/);
+	});
+
+	test.each([
+		['protocol_header', 'x-forwarded-proto', 'https, http'],
+		['host_header', 'x-forwarded-host', 'a.example, b.example'],
+		['port_header', 'x-forwarded-port', '443, 8443']
+	] as const)('throws when %s carries multiple values', (key, header, value) => {
+		const req = make_request({ [header]: value });
+		const url = new URL(req.url);
+		expect(() => resolve_origin(req, url, { ...base_cfg, [key]: header })).toThrow(
+			/Multiple values provided/
+		);
 	});
 
 	test('throws when protocol_header value contains a colon (host-injection guard)', () => {
@@ -171,6 +204,24 @@ describe('resolve_origin', () => {
 				port_header: 'x-forwarded-port'
 			})
 		).toThrow(/invalid port/);
+	});
+});
+
+describe('validate_env', () => {
+	test('ignores everything when no prefix is configured', () => {
+		expect(() => validate_env({ FOO: '1', KEEP_ALIVE_TIMEOUT: '5' }, '')).not.toThrow();
+	});
+
+	test('accepts supported prefixed variables and unrelated ones', () => {
+		expect(() =>
+			validate_env({ APP_PORT: '3000', APP_IDLE_TIMEOUT: '30', PATH: '/usr/bin' }, 'APP_')
+		).not.toThrow();
+	});
+
+	test('throws on an unknown prefixed variable', () => {
+		expect(() => validate_env({ APP_PORT: '3000', APP_SECRET: 'x' }, 'APP_')).toThrow(
+			/change envPrefix \(APP_\).*unexpectedly saw APP_SECRET/
+		);
 	});
 });
 
@@ -262,6 +313,23 @@ describe('make_asset_handler', () => {
 		expect(res.headers.get('content-length')).toBe(String(FILE_SIZE));
 		expect(res.headers.get('accept-ranges')).toBe('bytes');
 		expect(res.body).not.toBeNull();
+	});
+
+	test('sends no cache-control by default', () => {
+		const handler = make_asset_handler('/bunfs/favicon.png');
+		const res = handler(new Request('http://localhost/favicon.png'));
+		expect(res.headers.get('cache-control')).toBeNull();
+	});
+
+	test('sends the given cache-control on full and range responses', () => {
+		const handler = make_asset_handler('/bunfs/app.js', 'public,max-age=31536000,immutable');
+		const full = handler(new Request('http://localhost/app.js'));
+		expect(full.headers.get('cache-control')).toBe('public,max-age=31536000,immutable');
+		const partial = handler(
+			new Request('http://localhost/app.js', { headers: { range: 'bytes=0-9' } })
+		);
+		expect(partial.status).toBe(206);
+		expect(partial.headers.get('cache-control')).toBe('public,max-age=31536000,immutable');
 	});
 
 	test('HEAD returns headers but null body', () => {

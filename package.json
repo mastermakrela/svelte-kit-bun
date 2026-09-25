@@ -1,6 +1,6 @@
 {
 	"name": "svelte-kit-bun",
-	"version": "0.6.1",
+	"version": "0.6.2",
 	"description": "Experimental adapter for SvelteKit apps that compiles to a Bun single-file executable",
 	"keywords": [
 		"adapter",

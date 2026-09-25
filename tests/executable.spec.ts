@@ -45,6 +45,7 @@ async function wait_for_http(url: string, timeout_ms: number) {
 
 let server: ChildProcessByStdio<null, Readable, Readable> | null = null;
 let base_url = '';
+let stderr = '';
 
 beforeAll(async () => {
 	rmSync(join(fixture, 'build'), { recursive: true, force: true });
@@ -64,11 +65,21 @@ beforeAll(async () => {
 	const port = await free_port();
 	base_url = `http://127.0.0.1:${port}`;
 	server = spawn(binary, [], {
-		env: { ...process.env, HOST: '127.0.0.1', PORT: String(port) },
+		env: {
+			...process.env,
+			HOST: '127.0.0.1',
+			PORT: String(port),
+			// short enough that /stream/quiet outlives it (see that route)
+			IDLE_TIMEOUT: '1',
+			HOST_HEADER: 'x-forwarded-host'
+		},
 		stdio: ['ignore', 'pipe', 'pipe']
 	});
 	server.stdout.on('data', (b) => process.stdout.write(`[app stdout] ${b}`));
-	server.stderr.on('data', (b) => process.stderr.write(`[app stderr] ${b}`));
+	server.stderr.on('data', (b) => {
+		stderr += b;
+		process.stderr.write(`[app stderr] ${b}`);
+	});
 
 	await wait_for_http(`${base_url}/about`, 15_000);
 }, 180_000);
@@ -214,5 +225,40 @@ describe('compiled executable bundling', () => {
 		const bytes = new Uint8Array(await res.arrayBuffer());
 		expect(bytes.byteLength).toBe(16);
 		expect(Buffer.from(bytes).equals(on_disk.subarray(0, 16))).toBe(true);
+	});
+
+	test('logs the address it is actually listening on', () => {
+		expect(stderr).toContain(`Listening on ${base_url}`);
+	});
+
+	test('hashed immutable assets are cached forever, other assets are not', async () => {
+		const html = await fetch(`${base_url}/assets`).then((r) => r.text());
+		const css_href = html.match(/href="((?:\/|\.\/)_app\/immutable\/assets\/[^"]+\.css)"/)?.[1];
+		expect(css_href).toBeTruthy();
+
+		const immutable = await fetch(`${base_url}${abs(css_href!)}`);
+		expect(immutable.headers.get('cache-control')).toBe('public,max-age=31536000,immutable');
+
+		const plain = await fetch(`${base_url}/favicon.png`);
+		expect(plain.headers.get('cache-control')).toBeNull();
+	});
+
+	test('server-sent events opt out of proxy buffering', async () => {
+		const res = await fetch(`${base_url}/stream`);
+		expect(res.headers.get('content-type')).toBe('text/event-stream');
+		expect(res.headers.get('x-accel-buffering')).toBe('no');
+		expect(await res.text()).toContain('data: tick 2');
+	});
+
+	test('a quiet server-sent-events stream is not cut off by IDLE_TIMEOUT', async () => {
+		const res = await fetch(`${base_url}/stream/quiet`);
+		expect(await res.text()).toBe('data: late\n\n');
+	});
+
+	test('a multi-valued proxy header is rejected with 400', async () => {
+		const res = await fetch(`${base_url}/`, {
+			headers: { 'x-forwarded-host': 'a.example, b.example' }
+		});
+		expect(res.status).toBe(400);
 	});
 });

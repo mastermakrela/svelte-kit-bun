@@ -3,6 +3,48 @@ const BUN_MAX_IDLE_TIMEOUT_S = 255;
 
 const XFF = 'x-forwarded-for';
 
+// Hashed `/{appPath}/immutable/*` files never change, so they can be cached forever.
+const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
+
+/**
+ * Environment variables the runtime reads (without the `envPrefix`). When an
+ * `envPrefix` is configured, any other prefixed variable is a configuration
+ * mistake and `validate_env` throws — same contract as adapter-node's `env.js`.
+ */
+export const SUPPORTED_ENV_VARS = new Set([
+	'HOST',
+	'PORT',
+	'ORIGIN',
+	'XFF_DEPTH',
+	'ADDRESS_HEADER',
+	'PROTOCOL_HEADER',
+	'HOST_HEADER',
+	'PORT_HEADER',
+	'BODY_SIZE_LIMIT',
+	'IDLE_TIMEOUT',
+	'SHUTDOWN_TIMEOUT'
+]);
+
+/**
+ * Fail fast on prefixed variables the runtime does not understand — a mistyped
+ * or colliding `envPrefix` would otherwise be silently ignored.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @param {string} env_prefix
+ */
+export function validate_env(env, env_prefix) {
+	if (!env_prefix) return;
+
+	for (const name in env) {
+		if (!name.startsWith(env_prefix)) continue;
+		if (!SUPPORTED_ENV_VARS.has(name.slice(env_prefix.length))) {
+			throw new Error(
+				`You should change envPrefix (${env_prefix}) to avoid conflicts with existing environment variables — unexpectedly saw ${name}`
+			);
+		}
+	}
+}
+
 /**
  * Runtime for adapter-bun. Invoked from the codegen-emitted entry.js with the
  * Server class, manifest, and asset maps already resolved to $bunfs paths.
@@ -26,6 +68,8 @@ export async function start({
 	server_assets,
 	env_prefix = ''
 }) {
+	validate_env(process.env, env_prefix);
+
 	const server = new Server(manifest);
 
 	await server.init({
@@ -73,13 +117,19 @@ export async function start({
 		throw new Error(`${env_prefix}SHUTDOWN_TIMEOUT must be a non-negative number`);
 	}
 
-	// Prerendered overrides client on key overlap.
+	// Only hashed build output gets the immutable cache header — not e.g. version.json.
+	const immutable_prefix = `/${manifest.appPath}/immutable/`;
+
 	/** @type {Record<string, (request: Request) => Response>} */
 	const routes = {};
-	for (const [url_path, bunfs_path] of Object.entries({
-		...client_assets,
-		...prerendered_assets
-	})) {
+	for (const [url_path, bunfs_path] of Object.entries(client_assets)) {
+		const cache_control = url_path.startsWith(immutable_prefix)
+			? IMMUTABLE_CACHE_CONTROL
+			: undefined;
+		routes[url_path] = make_asset_handler(bunfs_path, cache_control);
+	}
+	// Prerendered overrides client on key overlap.
+	for (const [url_path, bunfs_path] of Object.entries(prerendered_assets)) {
 		routes[url_path] = make_asset_handler(bunfs_path);
 	}
 
@@ -93,12 +143,19 @@ export async function start({
 			try {
 				const url = new URL(request.url);
 
-				const effective_origin = resolve_origin(request, url, {
-					origin_env,
-					protocol_header,
-					host_header,
-					port_header
-				});
+				let effective_origin;
+				try {
+					effective_origin = resolve_origin(request, url, {
+						origin_env,
+						protocol_header,
+						host_header,
+						port_header
+					});
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					process.stderr.write(`adapter-bun: Could not determine request origin: ${message}\n`);
+					return new Response('Bad Request', { status: 400 });
+				}
 
 				let final_url = url;
 				let final_request = request;
@@ -124,11 +181,26 @@ export async function start({
 					}
 				}
 
-				return await server.respond(final_request, {
+				const response = await server.respond(final_request, {
 					platform: { server: srv },
 					getClientAddress: () =>
 						get_client_address(request, srv, address_header, xff_depth, env_prefix)
 				});
+
+				// Reverse proxies such as nginx buffer responses by default (ignoring
+				// `cache-control`), which breaks streaming responses like server-sent events.
+				// `X-Accel-Buffering: no` opts out of that buffering and is a no-op on proxies
+				// that don't recognise it. See https://github.com/sveltejs/kit/issues/15790
+				if (response.headers.get('content-type') === 'text/event-stream') {
+					response.headers.set('x-accel-buffering', 'no');
+
+					// A server-sent-events stream may stay quiet for longer than
+					// `IDLE_TIMEOUT`, which would have Bun close the connection
+					// mid-response. Opt this connection out.
+					if (idle_timeout > 0) srv.timeout(request, 0);
+				}
+
+				return response;
 			} catch (err) {
 				process.stderr.write(
 					`adapter-bun: unhandled error for ${request.method} ${request.url}: ${
@@ -140,7 +212,8 @@ export async function start({
 		}
 	});
 
-	process.stderr.write(`Listening on http://${host}:${port}\n`);
+	// the bound address, not the requested one — e.g. the real port for `PORT=0`
+	process.stderr.write(`Listening on ${bun_server.url.origin}\n`);
 
 	await new Promise((resolve) => {
 		let stopping = false;
@@ -219,25 +292,26 @@ export function resolve_origin(
 
 	const headers = request.headers;
 
-	let protocol = url.protocol.slice(0, -1);
-	if (protocol_header) {
-		const value = headers.get(protocol_header);
-		if (value) {
-			// prevent host-injection through the protocol header (RFC 7230 §5.5)
-			if (value.includes(':')) {
-				throw new Error(
-					`The ${protocol_header} header specified '${value}' which is invalid because it includes \`:\`. It should only contain the protocol scheme (e.g. \`https\`)`
-				);
-			}
-			protocol = value;
-		}
+	const raw_protocol = protocol_header
+		? normalise_header(protocol_header, headers.get(protocol_header))
+		: undefined;
+	const protocol = raw_protocol ? decodeURIComponent(raw_protocol) : url.protocol.slice(0, -1);
+	// prevent host-injection through the protocol header (RFC 7230 §5.5)
+	if (protocol.includes(':')) {
+		throw new Error(
+			`The ${protocol_header} header specified '${protocol}' which is invalid because it includes \`:\`. It should only contain the protocol scheme (e.g. \`https\`)`
+		);
 	}
 
-	const hostname = host_header ? headers.get(host_header) || url.hostname : url.hostname;
+	// `url.host` (not `url.hostname`) so the fallback carries a non-default port, same
+	// as upstream falling back to the raw `host` header (which is `hostname[:port]`).
+	const host = host_header
+		? normalise_header(host_header, headers.get(host_header)) || url.host
+		: url.host;
 
 	let port = '';
 	if (port_header) {
-		const value = headers.get(port_header);
+		const value = normalise_header(port_header, headers.get(port_header));
 		if (value) {
 			if (Number.isNaN(Number(value))) {
 				throw new Error(
@@ -248,7 +322,30 @@ export function resolve_origin(
 		}
 	}
 
-	return port ? `${protocol}://${hostname}:${port}` : `${protocol}://${hostname}`;
+	return port ? `${protocol}://${host}:${port}` : `${protocol}://${host}`;
+}
+
+/**
+ * Reject a proxy header (protocol/host/port) that carries more than one value, mirroring
+ * upstream adapter-node's `normalise_header`. Node's `IncomingHttpHeaders` can hand back
+ * an array for a repeated header; Bun's `Headers.get()` already joins repeats with `, ` so
+ * there is no array form to check here — a comma inside one of these single-valued headers
+ * is therefore treated as "multiple values" and rejected the same way. This does NOT apply
+ * to `ADDRESS_HEADER`, which is legitimately comma-separated when it's `x-forwarded-for`
+ * (see `get_client_address`).
+ *
+ * @param {string} name    lowercased header name, for the error message
+ * @param {string | null} value
+ * @returns {string | undefined}
+ */
+function normalise_header(name, value) {
+	if (value === null) return undefined;
+	if (value.includes(',')) {
+		throw new Error(
+			`Multiple values provided for ${name} header where only one expected: ${value}`
+		);
+	}
+	return value;
 }
 
 /**
@@ -309,12 +406,15 @@ export function parse_as_bytes(value, env_name) {
  * Per-asset handler: GET, HEAD, OPTIONS, plus `Range: bytes=start-end` (206). Other methods → 405.
  *
  * @param {string} bunfs_path
+ * @param {string} [cache_control]  sent with every 200/206 response when set
  * @returns {(request: Request) => Response}
  */
-export function make_asset_handler(bunfs_path) {
+export function make_asset_handler(bunfs_path, cache_control) {
 	const file = Bun.file(bunfs_path);
 	const type = file.type;
 	const size = file.size;
+	/** @type {Record<string, string>} */
+	const cache_headers = cache_control ? { 'cache-control': cache_control } : {};
 
 	return (request) => {
 		const method = request.method;
@@ -344,6 +444,7 @@ export function make_asset_handler(bunfs_path) {
 					return new Response(body, {
 						status: 206,
 						headers: {
+							...cache_headers,
 							'content-type': type,
 							'content-range': `bytes ${start}-${end}/${size}`,
 							'content-length': String(end - start + 1),
@@ -361,6 +462,7 @@ export function make_asset_handler(bunfs_path) {
 		const body = method === 'HEAD' ? null : file;
 		return new Response(body, {
 			headers: {
+				...cache_headers,
 				'content-type': type,
 				'content-length': String(size),
 				'accept-ranges': 'bytes'
