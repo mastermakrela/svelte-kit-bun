@@ -41,8 +41,9 @@ jobs:
       #   SvelteKit 3 line never becomes the default install before Kit 3 is stable
       # - a release newer than `latest` becomes `latest`
       # - a release older than `latest` (a patch on a maintenance branch, e.g. `0.6.2`
-      #   for SvelteKit 2 after `0.7.0` is out) goes to `v<major>.<minor>` (`v0.6`)
-      #   instead of moving `latest` backwards
+      #   for SvelteKit 2 after `0.7.0` is out) goes to `latest-<major>.<minor>`
+      #   (`latest-0.6`) instead of moving `latest` backwards; npm rejects tags that
+      #   parse as a semver range, so it can't be `v0.6`
       - name: Determine version and dist-tag
         id: release
         run: |
@@ -59,7 +60,7 @@ jobs:
             const prerelease = version.split("-")[1];
             if (prerelease) console.log(prerelease.split(".")[0]);
             else if (Bun.semver.order(version, latest) > 0) console.log("latest");
-            else console.log(`v${version.split(".").slice(0, 2).join(".")}`);
+            else console.log(`latest-${version.split(".").slice(0, 2).join(".")}`);
           ')
 
           echo "Publishing svelte-kit-bun@$VERSION with dist-tag '$TAG' (latest is $LATEST)"
