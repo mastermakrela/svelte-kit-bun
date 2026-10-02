@@ -158,11 +158,7 @@ interface BuilderMock {
 		findServerAssets: (routes: unknown[]) => string[];
 		hasServerInstrumentationFile: () => boolean;
 		instrument: (args: InstrumentCall) => void;
-		prerendered: {
-			paths: string[];
-			pages: Map<string, { file: string }>;
-			assets: Map<string, unknown>;
-		};
+		prerendered: { paths: string[] };
 		routes: unknown[];
 	};
 	logs: { minor: string[]; warn: string[]; error: string[] };
@@ -252,11 +248,7 @@ function create_builder_mock(
 						`const __mod = await import('./${relative(dirname(args.entrypoint), start)}');\n`
 				);
 			},
-			prerendered: {
-				paths: ['/about'],
-				pages: new Map([['/about', { file: 'about.html' }]]),
-				assets: new Map()
-			},
+			prerendered: { paths: ['/about'] },
 			routes: []
 		}
 	};
@@ -387,7 +379,7 @@ describe('adapt hook', () => {
 		]);
 
 		const manifest = mock.writes.get('build/server/manifest.js')!;
-		expect(manifest).toContain('export const prerendered = new Set(["/about"]);');
+		expect(manifest).not.toContain('prerendered');
 		expect(manifest).toContain('export const app_path = "_app";');
 		expect(manifest).toContain('export const mime_types = {".png":"image/png"};');
 
@@ -738,14 +730,18 @@ describe('precompression', () => {
 		expect(entry).not.toContain('.gz"');
 	});
 
-	test('a dotfile among builder.prerendered.assets is not embedded', async () => {
+	test('a prerendered dotfile is not embedded', async () => {
 		const mock = create_bun_mock(tmp_cwd);
 		vi.stubGlobal('Bun', mock.Bun);
 
 		const { builder } = create_builder_mock(tmp_cwd);
-		// `is_hidden` runs before the file is even touched on disk, so no file needs
-		// to actually exist at this path for the filtering behaviour to be observed.
-		builder.prerendered.assets = new Map([['/.env', {}]]);
+		builder.prerendered.paths = ['/about', '/.env'];
+		builder.writePrerendered = (dir) => {
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, 'about.html'), '<h1>About</h1>\n');
+			writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+			return ['about.html', '.env'];
+		};
 
 		const p = plugin({ compile: false });
 		await p.adapt(builder as never);
@@ -753,6 +749,32 @@ describe('precompression', () => {
 		const entry = mock.writes.get('build/entry.js')!;
 		expect(entry).not.toContain('.env');
 		expect(entry).not.toContain('/prerendered/.env');
+	});
+
+	test('prerendered paths map to the files Kit wrote for them, whatever kind they are', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		// a page with `trailingSlash: 'always'`, a non-HTML asset, and a redirect stub
+		// (in `paths`, but in neither `pages` nor `assets`)
+		builder.prerendered.paths = ['/docs/', '/data.json', '/moved'];
+		builder.writePrerendered = (dir) => {
+			mkdirSync(join(dir, 'docs'), { recursive: true });
+			writeFileSync(join(dir, 'docs/index.html'), '<h1>Docs</h1>\n');
+			writeFileSync(join(dir, 'data.json'), '{}\n');
+			writeFileSync(join(dir, 'moved.html'), '<meta http-equiv="refresh" content="0;url=/">');
+			return ['docs/index.html', 'data.json', 'moved.html'];
+		};
+
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).toContain('from "./prerendered/docs/index.html"');
+		expect(entry).toContain('"/docs/": { file: _prerendered_0');
+		expect(entry).toContain('"/data.json": { file: _prerendered_1');
+		expect(entry).toContain('"/moved": { file: _prerendered_2');
 	});
 });
 

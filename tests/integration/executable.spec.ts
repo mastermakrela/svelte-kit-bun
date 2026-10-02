@@ -272,6 +272,21 @@ describe('response semantics', () => {
 		expect(res.headers.get('location')).toBe('../about?q=1&x=2');
 	});
 
+	test('prerendered slash redirect only answers GET/HEAD', async () => {
+		const res = await fetch(`${base_url}/about/`, { method: 'POST', redirect: 'manual' });
+		await res.arrayBuffer();
+		expect(res.status).toBe(405);
+		expect(res.headers.get('allow')).toBe('GET, HEAD');
+	});
+
+	test('a prerendered redirect is served as the stub page Kit wrote for it', async () => {
+		const res = await fetch(`${base_url}/moved`, { redirect: 'manual' });
+		expect(res.status).toBe(200);
+		expect(res.headers.get('content-type')).toBe('text/html;charset=utf-8');
+		// `resolve()` makes the location relative under Kit 3, hence no fixed prefix
+		expect(await res.text()).toMatch(/<meta http-equiv="refresh" content="0;url=[^"]*about">/);
+	});
+
 	test('relative slash redirect resolves back to the prerendered page', async () => {
 		const res = await fetch(`${base_url}/about/`);
 		expect(res.status).toBe(200);

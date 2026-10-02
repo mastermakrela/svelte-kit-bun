@@ -101,7 +101,7 @@ export default function plugin(opts = {}) {
 
 			builder.log.minor('Copying assets');
 			const client_files = builder.writeClient(client_dir);
-			builder.writePrerendered(prerendered_dir);
+			const prerendered_files = builder.writePrerendered(prerendered_dir);
 
 			builder.log.minor(precompress ? 'Compressing assets' : 'Skipping precompression');
 			// `builder.compress` always writes a `.gz` *and* a `.br` sibling for every file it
@@ -122,7 +122,6 @@ export default function plugin(opts = {}) {
 			await Bun.write(
 				`${server_dir}/manifest.js`,
 				[
-					`export const prerendered = new Set(${JSON.stringify(builder.prerendered.paths)});`,
 					`export const app_path = ${JSON.stringify(builder.getAppPath())};`,
 					`export const mime_types = ${JSON.stringify(builder.mimeTypes)};`
 				].join('\n')
@@ -163,20 +162,18 @@ export default function plugin(opts = {}) {
 				.filter((rel) => !is_hidden(rel))
 				.map((rel) => asset_entry('client', rel, `/${base_segment}${rel}`, client_compressed_set));
 
-			const prerendered_assets = [
-				// Prerendered pages: URL key may differ from on-disk filename
-				// (e.g. `/foo` → `foo.html`), so use builder.prerendered.pages as source of truth.
-				...Array.from(builder.prerendered.pages, ([url_path, { file }]) =>
-					asset_entry('prerendered', file, url_path, prerendered_compressed_set)
-				),
-				// Non-HTML prerendered assets: URL path mirrors the on-disk layout.
-				...Array.from(builder.prerendered.assets.keys()).flatMap((url_path) => {
-					const rel = url_path.slice(base.length + 1);
-					return is_hidden(rel)
-						? []
-						: [asset_entry('prerendered', rel, url_path, prerendered_compressed_set)];
-				})
-			];
+			// Keyed by the exact paths Kit prerendered — pages, assets and redirect stubs —
+			// mirroring upstream adapter-node's `create_prerendered_table`, so a lookup hit is
+			// precisely a prerendered path and every other pathname misses.
+			const prerendered_file_set = new Set(prerendered_files.filter((rel) => !is_hidden(rel)));
+			const prerendered_assets = builder.prerendered.paths.flatMap((url_path) => {
+				// invert `output_filename` in Kit's prerenderer
+				const file = url_path.slice(base.length + 1) || 'index.html';
+				const rel = [file, file + (file.endsWith('/') ? 'index.html' : '.html')].find((f) =>
+					prerendered_file_set.has(f)
+				);
+				return rel ? [asset_entry('prerendered', rel, url_path, prerendered_compressed_set)] : [];
+			});
 
 			// `name` is already relative to the server output dir (e.g.
 			// `_app/immutable/assets/greeting.hash.txt`).

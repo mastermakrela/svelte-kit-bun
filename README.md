@@ -5,20 +5,20 @@
 ## Requirements
 
 - [Bun](https://bun.com/) >= 1.2.17 — the build and the resulting binary both run under Bun.
-- SvelteKit 3 `>= 3.0.0-next.27` (currently prerelease: `@sveltejs/kit@next`). This release line (`0.7`) uses the Kit 3 adapter API (`builder.generateServerInstance`, `builder.createInstrumentationInitializer`, `paths.origin`) and does not work with SvelteKit 2.
+- SvelteKit 3 (`@sveltejs/kit@^3.0.0`). This release line (`0.7`) uses the Kit 3 adapter API (`builder.generateServerInstance`, `builder.createInstrumentationInitializer`, `paths.origin`) and does not work with SvelteKit 2.
 
-| SvelteKit      | svelte-kit-bun | install                          |
-| -------------- | -------------- | -------------------------------- |
-| 3 (prerelease) | `0.7.0-next.*` | `bun add -d svelte-kit-bun@next` |
-| 2              | `0.6.x`        | `bun add -d svelte-kit-bun@0.6`  |
+| SvelteKit | svelte-kit-bun | install                         |
+| --------- | -------------- | ------------------------------- |
+| 3         | `0.7.x`        | `bun add -d svelte-kit-bun`     |
+| 2         | `0.6.x`        | `bun add -d svelte-kit-bun@0.6` |
 
-Until SvelteKit 3 is stable, the default (`latest`) install stays on `0.6.x`, mirroring upstream's `@sveltejs/adapter-node@5` (Kit 2) / `@6` (Kit 3) split.
+This mirrors upstream's `@sveltejs/adapter-node@6` (Kit 3) / `@5` (Kit 2) split.
 
 ## Caveats
 
 - **No native (N-API) modules in single-file mode.** Packages that ship `.node` addons (`sharp`, `better-sqlite3`, `argon2`, `canvas`, etc.) cannot be embedded in the executable. WASM works. Native addons _do_ work if you set `compile: false`.
 - **Read-only filesystem (single-file mode).** Embedded assets live in Bun's `$bunfs`, which is read-only. Persist any user data outside the binary.
-- **Not yet supported:** service worker embedding, precompression, socket activation.
+- **Not yet supported:** service worker embedding, socket activation.
 
 ## Usage
 
@@ -81,7 +81,7 @@ The built app reads exactly these variables at startup — nothing else:
 | `PROTOCOL_HEADER`         | —         | Header carrying the forwarded protocol, e.g. `X-Forwarded-Proto`. Without it, the derived origin defaults to `https`.                                  |
 | `HOST_HEADER`             | —         | Header carrying the forwarded host, e.g. `X-Forwarded-Host`.                                                                                           |
 | `PORT_HEADER`             | —         | Header carrying the forwarded port, e.g. `X-Forwarded-Port`.                                                                                           |
-| `BODY_SIZE_LIMIT`         | `512K`    | Maximum request body size; a number of bytes, optionally suffixed with `K`, `M` or `G`.                                                                |
+| `BODY_SIZE_LIMIT`         | `512K`    | Maximum request body size; a number of bytes, optionally suffixed with `K`, `M` or `G`, or `Infinity` for no limit.                                    |
 | `SHUTDOWN_TIMEOUT`        | `30`      | Seconds to wait for in-flight requests to finish after `SIGTERM`/`SIGINT` before connections are closed forcibly.                                      |
 | `CONNECTION_IDLE_TIMEOUT` | `0`       | Seconds `Bun.serve` lets a connection sit idle before closing it; `0` disables the timeout, the maximum is `255`. See [Idle timeouts](#idle-timeouts). |
 
@@ -155,7 +155,7 @@ Embedded assets are served with the same semantics as `@sveltejs/adapter-node`:
 - Every method other than `GET`/`HEAD` — including `OPTIONS` — gets `405 Method Not Allowed` with `allow: GET, HEAD`.
 - Dotfiles under `static/` (any path segment starting with `.`) are not embedded in the executable or served, except under `.well-known/`.
 - A `.html` file in `static/` gets clean-URL aliases: `/foo` and `/foo/` resolve to `foo.html`, or to `foo/index.html` when only that exists. An exact file always wins over an alias, and when both `foo.html` and `foo/index.html` exist, `foo.html` claims the aliases.
-- Trailing-slash redirects for prerendered pages use a **relative** `location` (e.g. `../about`), so they keep working behind a proxy that strips a mount prefix. The query string is preserved.
+- Every path SvelteKit prerendered — pages, non-HTML assets, and redirects (served as the stub page SvelteKit writes for them) — is matched only at that exact path. Its other trailing-slash form gets a `308` with a **relative** `location` (`../about`, or `./about/` the other way round), so it keeps working behind a proxy that strips a mount prefix; the query string is preserved, and a non-`GET`/`HEAD` request gets `405` like any other static path.
 - Responses whose `content-type` is exactly `text/event-stream` get `x-accel-buffering: no`, which stops nginx-style proxies from buffering server-sent events.
 
 ### Windows executable icon and metadata

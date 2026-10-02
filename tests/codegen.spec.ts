@@ -73,9 +73,7 @@ describe('generate_entry', () => {
 		expect(output).not.toContain("with { type: 'file' }");
 
 		expect(output).toContain('import { server } from "./server/server.js";');
-		expect(output).toContain(
-			'import { prerendered, app_path, mime_types } from "./server/manifest.js";'
-		);
+		expect(output).toContain('import { app_path, mime_types } from "./server/manifest.js";');
 		expect(output).toContain('import { start } from "./serve.js";');
 		expect(output).toContain('await start({');
 
@@ -275,7 +273,7 @@ describe('generate_entry', () => {
 		});
 
 		const server_fixed = output.indexOf('import { server }');
-		const manifest_fixed = output.indexOf('import { prerendered');
+		const manifest_fixed = output.indexOf('import { app_path');
 		const start_fixed = output.indexOf('import { start }');
 		const client_import = output.indexOf('_client_0');
 		const prerendered_import = output.indexOf('_prerendered_0');
@@ -376,7 +374,7 @@ describe('generate_entry', () => {
 		});
 
 		expect(output).toContain('import { server } from "../weird/server.mjs";');
-		expect(output).toContain('import { prerendered, app_path, mime_types } from "./nested/m.js";');
+		expect(output).toContain('import { app_path, mime_types } from "./nested/m.js";');
 		expect(output).toContain('import { start } from "./serve.mjs";');
 	});
 });

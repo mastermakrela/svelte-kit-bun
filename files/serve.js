@@ -194,6 +194,11 @@ const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
  */
 
 /**
+ * @typedef {Object} Redirect
+ * @property {string} location  relative reference to the canonical prerendered path
+ */
+
+/**
  * Parse `Accept-Encoding` and pick the preferred variant that exists, mirroring
  * upstream adapter-node's `negotiate`: q-values (default 1), `*` as a fallback
  * weight, gzip preferred over br only when its q is strictly higher, and q=0
@@ -255,15 +260,15 @@ export function etag_matches(header, etag) {
  * both forms exist `foo.html` claims the aliases because it sorts first) — plus
  * prerendered assets, matched only at their exact path. Client assets win a key
  * collision, mirroring upstream adapter-node's `create_file_map`. The
- * non-canonical trailing-slash form of a prerendered path is handled separately
- * in `fetch` (see the `prerendered` Set), not aliased here.
+ * non-canonical trailing-slash form of a prerendered path maps to a 308 redirect
+ * (relative `location`) to the canonical one, unless another file claims it.
  *
  * @param {Object} opts
  * @param {string} opts.app_path
  * @param {Record<string, string>} opts.mime_types
  * @param {Record<string, BuiltAsset>} opts.client_assets
  * @param {Record<string, BuiltAsset>} opts.prerendered_assets
- * @returns {Map<string, Asset>}
+ * @returns {Map<string, Asset | Redirect>}
  */
 export function create_file_map({ app_path, mime_types, client_assets, prerendered_assets }) {
 	// Only hashed build output gets the immutable cache header — not e.g. version.json.
@@ -280,7 +285,7 @@ export function create_file_map({ app_path, mime_types, client_assets, prerender
 		cache_control: key.startsWith(immutable_prefix) ? IMMUTABLE_CACHE_CONTROL : undefined
 	});
 
-	/** @type {Map<string, Asset>} */
+	/** @type {Map<string, Asset | Redirect>} */
 	const files = new Map();
 
 	const client_keys = Object.keys(client_assets).sort();
@@ -300,6 +305,13 @@ export function create_file_map({ app_path, mime_types, client_assets, prerender
 
 	for (const [key, raw] of Object.entries(prerendered_assets)) {
 		if (!files.has(key)) files.set(key, to_asset(key, raw));
+	}
+
+	for (const key of Object.keys(prerendered_assets)) {
+		const inverted = key.at(-1) === '/' ? key.slice(0, -1) : key + '/';
+		if (inverted && !files.has(inverted)) {
+			files.set(inverted, { location: relative_pathname(inverted, key) });
+		}
 	}
 
 	return files;
@@ -332,7 +344,6 @@ export function remove_stale_socket(path) {
  *
  * @param {Object} options
  * @param {import('@sveltejs/kit').Server} options.server
- * @param {Set<string>} options.prerendered
  * @param {string} options.app_path   `builder.getAppPath()`, e.g. `_app` or `base/_app`
  * @param {Record<string, string>} options.mime_types  `builder.mimeTypes`
  * @param {Record<string, BuiltAsset>} options.client_assets      URL path -> build-time asset data
@@ -344,7 +355,6 @@ export function remove_stale_socket(path) {
  */
 export async function start({
 	server,
-	prerendered,
 	app_path,
 	mime_types,
 	client_assets,
@@ -375,9 +385,14 @@ export async function start({
 	});
 
 	const files = create_file_map({ app_path, mime_types, client_assets, prerendered_assets });
-	/** @type {Map<string, (request: Request) => Response>} */
+	/** @type {Map<string, (request: Request, search: string) => Response>} */
 	const static_handlers = new Map();
-	for (const [key, asset] of files) static_handlers.set(key, make_asset_handler(asset));
+	for (const [key, entry] of files) {
+		static_handlers.set(
+			key,
+			'location' in entry ? make_redirect_handler(entry.location) : make_asset_handler(entry)
+		);
+	}
 
 	/** @type {(request: Request, srv: import('bun').Server<unknown>) => Promise<Response>} */
 	const fetch = async (request, srv) => {
@@ -389,7 +404,7 @@ export async function start({
 			// resolution / SSR, same as upstream adapter-node's static middleware
 			// running ahead of the SvelteKit handler.
 			const static_handler = static_handlers.get(pathname);
-			if (static_handler) return static_handler(request);
+			if (static_handler) return static_handler(request, url.search);
 
 			let effective_origin;
 			try {
@@ -405,24 +420,10 @@ export async function start({
 				return new Response('Bad Request', { status: 400 });
 			}
 
-			let final_url = url;
-			let final_request = request;
-			if (`${url.protocol}//${url.host}` !== effective_origin) {
-				final_request = new Request(`${effective_origin}${url.pathname}${url.search}`, request);
-				final_url = new URL(final_request.url);
-			}
-
-			// `pathname` is unaffected by the origin swap above — only the
-			// protocol/host of `final_url` differ from `url`.
-			if (!prerendered.has(pathname)) {
-				// remove or add trailing slash as appropriate
-				const inverted = pathname.at(-1) === '/' ? pathname.slice(0, -1) : pathname + '/';
-				if (prerendered.has(inverted)) {
-					// a *relative* location survives a proxy that strips a mount prefix
-					const location = relative_pathname(pathname, inverted) + final_url.search;
-					return new Response(null, { status: 308, headers: { location } });
-				}
-			}
+			const final_request =
+				`${url.protocol}//${url.host}` === effective_origin
+					? request
+					: new Request(`${effective_origin}${url.pathname}${url.search}`, request);
 
 			const response = await server.respond(final_request, {
 				platform: { server: srv },
@@ -468,7 +469,10 @@ export async function start({
 		fetch
 	});
 
-	process.stderr.write(`Listening on ${socket_path || `http://${host}:${port}`}\n`);
+	// the bound address, not the configured one, so e.g. `PORT=0` logs the real port
+	process.stderr.write(
+		`Listening on ${socket_path || `http://${bun_server.hostname}:${bun_server.port}`}\n`
+	);
 
 	await new Promise((resolve) => {
 		let stopping = false;
@@ -641,8 +645,8 @@ export function mime_type(url_path, mime_types) {
 
 /**
  * Relative reference from `from` to `to`, which must differ only by a trailing slash.
- * Mirrors adapter-node's helper so slash redirects keep working behind a proxy that
- * strips a mount prefix.
+ * Mirrors Kit's and adapter-node's helper so slash redirects keep working behind a
+ * proxy that strips a mount prefix.
  *
  * @param {string} from
  * @param {string} to
@@ -651,7 +655,8 @@ export function mime_type(url_path, mime_types) {
 export function relative_pathname(from, to) {
 	const segment = to.replace(/\/$/, '').split('/').at(-1);
 
-	return from.endsWith('/') ? `../${segment}` : `${segment}/`;
+	// The prefix prevents a colon in the segment from being interpreted as a URL scheme.
+	return from.endsWith('/') ? `../${segment}` : `./${segment}/`;
 }
 
 /**
@@ -700,12 +705,31 @@ export function parse_as_bytes(value, env_name) {
 			G: 1024 * 1024 * 1024
 		}[value[value.length - 1]?.toUpperCase() ?? ''] ?? 1;
 	const numeric = Number(multiplier !== 1 ? value.substring(0, value.length - 1) : value);
-	if (!Number.isFinite(numeric) || numeric < 0) {
+	// `Infinity` is allowed: it disables the limit, as SvelteKit's own 413 message suggests
+	if (Number.isNaN(numeric) || numeric < 0) {
 		throw new Error(
 			`${env_name} must be a non-negative number, optionally suffixed with K, M, or G (got '${value}')`
 		);
 	}
 	return numeric * multiplier;
+}
+
+/**
+ * Handler for the non-canonical trailing-slash form of a prerendered path: a 308
+ * to the canonical one, keeping the query string, for GET/HEAD only — mirroring
+ * upstream adapter-node's `serve_static`. The `location` is relative so it
+ * survives a proxy that strips a mount prefix.
+ *
+ * @param {string} location
+ * @returns {(request: Request, search: string) => Response}
+ */
+export function make_redirect_handler(location) {
+	return (request, search) => {
+		if (request.method !== 'GET' && request.method !== 'HEAD') {
+			return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } });
+		}
+		return new Response(null, { status: 308, headers: { location: location + search } });
+	};
 }
 
 /**

@@ -230,8 +230,8 @@ describe('mime_type', () => {
 
 describe('relative_pathname', () => {
 	test('adds a trailing slash', () => {
-		expect(relative_pathname('/about', '/about/')).toBe('about/');
-		expect(relative_pathname('/a/b/c', '/a/b/c/')).toBe('c/');
+		expect(relative_pathname('/about', '/about/')).toBe('./about/');
+		expect(relative_pathname('/a/b/c', '/a/b/c/')).toBe('./c/');
 	});
 
 	test('removes a trailing slash', () => {
@@ -258,12 +258,13 @@ describe('parse_as_bytes', () => {
 		['1G', 1024 * 1024 * 1024],
 		['0', 0],
 		['1k', 1024],
-		['1g', 1024 * 1024 * 1024]
+		['1g', 1024 * 1024 * 1024],
+		['Infinity', Infinity]
 	] as const)('parses %s as %d', (input, expected) => {
 		expect(parse_as_bytes(input, 'BODY_SIZE_LIMIT')).toBe(expected);
 	});
 
-	test.each(['abc', '-1', '-1K', 'Kabc', '1.2.3'] as const)(
+	test.each(['abc', '-1', '-1K', 'Kabc', '1.2.3', '-Infinity'] as const)(
 		'throws on invalid input: %s',
 		(input) => {
 			expect(() => parse_as_bytes(input, 'BODY_SIZE_LIMIT')).toThrow(/BODY_SIZE_LIMIT must be/);
@@ -1055,7 +1056,7 @@ describe('create_file_map', () => {
 			prerendered_assets: { '/overlap': built_asset('/bunfs/prerendered') }
 		});
 
-		expect(files.get('/overlap')?.file).toBe('/bunfs/client');
+		expect(files.get('/overlap')).toMatchObject({ file: '/bunfs/client' });
 	});
 
 	test('`/foo` and `/foo/` alias to `foo.html`', () => {
@@ -1065,9 +1066,9 @@ describe('create_file_map', () => {
 			prerendered_assets: {}
 		});
 
-		expect(files.get('/docs')?.file).toBe('/bunfs/docs.html');
-		expect(files.get('/docs/')?.file).toBe('/bunfs/docs.html');
-		expect(files.get('/docs')?.type).toBe('text/html;charset=utf-8');
+		expect(files.get('/docs')).toMatchObject({ file: '/bunfs/docs.html' });
+		expect(files.get('/docs/')).toMatchObject({ file: '/bunfs/docs.html' });
+		expect(files.get('/docs')).toMatchObject({ type: 'text/html;charset=utf-8' });
 	});
 
 	test('`/foo` and `/foo/` alias to `foo/index.html` when only that exists', () => {
@@ -1077,8 +1078,8 @@ describe('create_file_map', () => {
 			prerendered_assets: {}
 		});
 
-		expect(files.get('/guide')?.file).toBe('/bunfs/guide/index.html');
-		expect(files.get('/guide/')?.file).toBe('/bunfs/guide/index.html');
+		expect(files.get('/guide')).toMatchObject({ file: '/bunfs/guide/index.html' });
+		expect(files.get('/guide/')).toMatchObject({ file: '/bunfs/guide/index.html' });
 	});
 
 	test('`foo.html` claims the alias over `foo/index.html`, sorting first', () => {
@@ -1091,7 +1092,7 @@ describe('create_file_map', () => {
 			prerendered_assets: {}
 		});
 
-		expect(files.get('/both')?.file).toBe('/bunfs/both.html');
+		expect(files.get('/both')).toMatchObject({ file: '/bunfs/both.html' });
 	});
 
 	test('an exact file key always wins over an alias', () => {
@@ -1104,7 +1105,7 @@ describe('create_file_map', () => {
 			prerendered_assets: {}
 		});
 
-		expect(files.get('/docs')?.file).toBe('/bunfs/docs-real');
+		expect(files.get('/docs')).toMatchObject({ file: '/bunfs/docs-real' });
 	});
 
 	test('a root-level index.html does not alias to an empty-string key', () => {
@@ -1115,7 +1116,7 @@ describe('create_file_map', () => {
 		});
 
 		expect(files.has('')).toBe(false);
-		expect(files.get('/')?.file).toBe('/bunfs/index.html');
+		expect(files.get('/')).toMatchObject({ file: '/bunfs/index.html' });
 	});
 
 	test('prerendered assets are keyed only at their exact path, not aliased', () => {
@@ -1126,7 +1127,31 @@ describe('create_file_map', () => {
 		});
 
 		expect(files.has('/about')).toBe(false);
-		expect(files.get('/about.html')?.file).toBe('/bunfs/about.html');
+		expect(files.get('/about.html')).toMatchObject({ file: '/bunfs/about.html' });
+	});
+
+	test('the other trailing-slash form of a prerendered path redirects to it, relatively', () => {
+		const files = create_file_map({
+			...base_opts,
+			client_assets: {},
+			prerendered_assets: {
+				'/about': built_asset('/bunfs/about.html'),
+				'/docs/': built_asset('/bunfs/docs/index.html')
+			}
+		});
+
+		expect(files.get('/about/')).toEqual({ location: '../about' });
+		expect(files.get('/docs')).toEqual({ location: './docs/' });
+	});
+
+	test('a client asset at the inverted path wins over the redirect', () => {
+		const files = create_file_map({
+			...base_opts,
+			client_assets: { '/about/': built_asset('/bunfs/client') },
+			prerendered_assets: { '/about': built_asset('/bunfs/about.html') }
+		});
+
+		expect(files.get('/about/')).toMatchObject({ file: '/bunfs/client' });
 	});
 
 	test('a hashed asset under the immutable prefix gets the immutable cache-control', () => {
@@ -1137,9 +1162,9 @@ describe('create_file_map', () => {
 			prerendered_assets: {}
 		});
 
-		expect(files.get('/_app/immutable/chunks/a.js')?.cache_control).toBe(
-			'public,max-age=31536000,immutable'
-		);
+		expect(files.get('/_app/immutable/chunks/a.js')).toMatchObject({
+			cache_control: 'public,max-age=31536000,immutable'
+		});
 	});
 });
 
@@ -1176,7 +1201,6 @@ describe('start', () => {
 		mime_types = {},
 		client_assets = {},
 		prerendered_assets = {},
-		prerendered = [],
 		respond = async () => new Response('ssr'),
 		origin
 	}: {
@@ -1184,7 +1208,6 @@ describe('start', () => {
 		mime_types?: Record<string, string>;
 		client_assets?: Record<string, ReturnType<typeof built_asset>>;
 		prerendered_assets?: Record<string, ReturnType<typeof built_asset>>;
-		prerendered?: string[];
 		respond?: (request: Request) => Promise<Response>;
 		origin?: string;
 	} = {}): Promise<Runtime> {
@@ -1192,6 +1215,8 @@ describe('start', () => {
 		const responded: Request[] = [];
 
 		const srv = {
+			hostname: '0.0.0.0',
+			port: 3000,
 			stop: () => {},
 			timeout: (request: Request, seconds: number) => timeouts.push({ request, seconds }),
 			requestIP: () => ({ address: '1.2.3.4', family: 'IPv4', port: 1234 })
@@ -1229,7 +1254,6 @@ describe('start', () => {
 
 		const started = start({
 			server: server as never,
-			prerendered: new Set(prerendered),
 			app_path,
 			mime_types,
 			client_assets,
@@ -1444,7 +1468,9 @@ describe('start', () => {
 
 	describe('fetch handler', () => {
 		test('redirects a prerendered page’s trailing-slash variant with a relative location', async () => {
-			runtime = await start_runtime({ prerendered: ['/about'] });
+			runtime = await start_runtime({
+				prerendered_assets: { '/about': built_asset('/bunfs/about.html') }
+			});
 
 			const res = await runtime.serve.fetch(
 				new Request('http://localhost/about/?q=1'),
@@ -1453,6 +1479,20 @@ describe('start', () => {
 			expect(res.status).toBe(308);
 			expect(res.headers.get('location')).toBe('../about?q=1');
 			// the redirect short-circuits: SvelteKit is never asked
+			expect(runtime.responded).toHaveLength(0);
+		});
+
+		test('the trailing-slash redirect only answers GET/HEAD', async () => {
+			runtime = await start_runtime({
+				prerendered_assets: { '/about': built_asset('/bunfs/about.html') }
+			});
+
+			const res = await runtime.serve.fetch(
+				new Request('http://localhost/about/', { method: 'POST' }),
+				runtime.srv
+			);
+			expect(res.status).toBe(405);
+			expect(res.headers.get('allow')).toBe('GET, HEAD');
 			expect(runtime.responded).toHaveLength(0);
 		});
 
@@ -1650,7 +1690,6 @@ describe('start', () => {
 		await expect(
 			start({
 				server: server as never,
-				prerendered: new Set(),
 				app_path: '_app',
 				mime_types: {},
 				client_assets: {},

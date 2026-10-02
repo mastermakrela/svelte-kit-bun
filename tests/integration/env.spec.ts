@@ -232,6 +232,36 @@ describe('idle timeout semantics', () => {
 		expect(stderr).toMatch(pattern);
 	});
 
+	test('PORT=0 logs the port the OS actually assigned', async () => {
+		const child = spawn('bun', [entry], {
+			env: { ...process.env, HOST: '127.0.0.1', PORT: '0' },
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
+
+		try {
+			const listening = await new Promise<string>((resolve, reject) => {
+				let stderr = '';
+				const timer = setTimeout(() => reject(new Error(`no listening line:\n${stderr}`)), 15_000);
+				child.stderr.on('data', (b) => {
+					stderr += b;
+					const match = /Listening on (\S+)/.exec(stderr);
+					if (match) {
+						clearTimeout(timer);
+						resolve(match[1]);
+					}
+				});
+				child.on('error', reject);
+			});
+
+			expect(listening).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+			expect(listening).not.toMatch(/:0$/);
+			// the logged address is the one actually serving
+			expect((await fresh_get(`${listening}/about`)).status).toBe(200);
+		} finally {
+			child.kill('SIGKILL');
+		}
+	});
+
 	describe('SOCKET_PATH', () => {
 		/** GET over a unix socket — `fetch`'s `unix` option is Bun-only, unavailable under vitest's Node worker. */
 		function socket_get(

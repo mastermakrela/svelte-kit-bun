@@ -2,7 +2,7 @@
 
 exports[`generate_entry > happy path: snapshot 1`] = `
 "import { server } from "./server/server.js";
-import { prerendered, app_path, mime_types } from "./server/manifest.js";
+import { app_path, mime_types } from "./server/manifest.js";
 import { start } from "./serve.js";
 
 import _client_0 from "./client/favicon.png" with { type: 'file' };
@@ -23,7 +23,6 @@ const server_assets = {
 
 await start({
 	server,
-	prerendered,
 	app_path,
 	mime_types,
 	client_assets,
@@ -35,7 +34,7 @@ await start({
 
 exports[`generate_entry > precompressed variants: snapshot 1`] = `
 "import { server } from "./server/server.js";
-import { prerendered, app_path, mime_types } from "./server/manifest.js";
+import { app_path, mime_types } from "./server/manifest.js";
 import { start } from "./serve.js";
 
 import _client_0 from "./client/app.js" with { type: 'file' };
@@ -55,7 +54,6 @@ const server_assets = {};
 
 await start({
 	server,
-	prerendered,
 	app_path,
 	mime_types,
 	client_assets,

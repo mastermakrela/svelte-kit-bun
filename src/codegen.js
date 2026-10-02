@@ -69,7 +69,7 @@ function render_asset_group(entries, prefix, with_metadata) {
  *
  * @param {Object} options
  * @param {string} options.server_path       - relative import path from entry.js to the module exporting the `server` instance
- * @param {string} options.manifest_path     - relative import path from entry.js to the module exporting `prerendered`, `app_path` and `mime_types`
+ * @param {string} options.manifest_path     - relative import path from entry.js to the module exporting `app_path` and `mime_types`
  * @param {string} options.serve_path        - relative import path from entry.js to serve.js
  * @param {AssetEntry[]} options.client_assets      - key = URL path
  * @param {AssetEntry[]} options.prerendered_assets - key = URL path
@@ -94,7 +94,7 @@ export function generate_entry({
 
 	const fixed_imports = [
 		`import { server } from ${JSON.stringify(server_path)};`,
-		`import { prerendered, app_path, mime_types } from ${JSON.stringify(manifest_path)};`,
+		`import { app_path, mime_types } from ${JSON.stringify(manifest_path)};`,
 		`import { start } from ${JSON.stringify(serve_path)};`
 	];
 
@@ -102,7 +102,6 @@ export function generate_entry({
 
 	const start_args = [
 		'server',
-		'prerendered',
 		'app_path',
 		'mime_types',
 		'client_assets',
