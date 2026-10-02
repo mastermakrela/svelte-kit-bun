@@ -45,7 +45,7 @@ export function hide_bun_marker_section(exe) {
 	if (unrecognized.length > 0) {
 		throw new Error(
 			'@sveltejs/adapter-bun: unrecognized section(s) after the resource section ' +
-				`(${unrecognized.map((s) => s.info.name).join(', ')}). This adapter\'s Windows ` +
+				`(${unrecognized.map((s) => s.info.name).join(', ')}). This adapter's Windows ` +
 				'icon/metadata post-processing only knows how to handle the `.bun` marker section ' +
 				"from the Bun version it was verified against — the compiled executable's layout " +
 				'has changed in a way this adapter does not understand. Please file an issue.'
@@ -83,7 +83,7 @@ function parse_version(version) {
 }
 
 /**
- * @typedef {NonNullable<NonNullable<Parameters<import('../index.js').default>[0]>['windows']>} WindowsOptions
+ * @typedef {NonNullable<import('../index.js').AdapterOptions['windows']>} WindowsOptions
  */
 
 /**
@@ -140,7 +140,9 @@ export function apply_windows_branding(exe_bytes, windows, icon_bytes) {
 
 		const existing_version_infos = Resource.VersionInfo.fromEntries(rsrc.entries);
 		const version_infos =
-			existing_version_infos.length > 0 ? existing_version_infos : [Resource.VersionInfo.createEmpty()];
+			existing_version_infos.length > 0
+				? existing_version_infos
+				: [Resource.VersionInfo.createEmpty()];
 
 		for (const version_info of version_infos) {
 			const langs = version_info.getAvailableLanguages();

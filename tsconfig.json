@@ -16,9 +16,11 @@
 		"index.js",
 		"src/**/*.js",
 		"files/**/*.js",
-		"tests/*.js",
-		"tests/*.ts",
+		"tests/**/*.js",
+		"tests/**/*.ts",
 		"ambient.d.ts",
 		"index.d.ts"
-	]
+	],
+	// fixture apps are separate SvelteKit projects with their own (generated) config
+	"exclude": ["tests/fixtures"]
 }

@@ -1,4 +1,4 @@
-import sampleMd from '$lib/sample.md?raw';
+import sampleMd from '#lib/sample.md?raw';
 
 export const prerender = false;
 

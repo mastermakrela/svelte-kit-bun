@@ -1,4 +1,6 @@
+import { closeSync, existsSync, mkdirSync, openSync, readSync, rmSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
+import { createHash } from 'node:crypto';
 import { generate_entry } from './src/codegen.js';
 import { apply_windows_branding } from './src/windows-brand.js';
 
@@ -17,6 +19,43 @@ const NATIVE_ADDON_PACKAGES = [
 ];
 
 /**
+ * Dotfiles are not embedded, with the customary exception of `.well-known/`,
+ * mirroring upstream adapter-node's `is_hidden`.
+ * @param {string} file - relative to the client output dir, no leading slash
+ */
+function is_hidden(file) {
+	return (
+		file.split('/').some((segment) => segment.startsWith('.')) && !file.startsWith('.well-known/')
+	);
+}
+
+/**
+ * Size and content hash (sha256, base64url) from one pass over the file, a buffer
+ * at a time, mirroring upstream adapter-node's `measure` — so large embedded
+ * assets are neither read fully into memory nor hashed twice.
+ * @param {string} path
+ * @param {Buffer} buffer
+ * @returns {{ size: number, etag: string }}
+ */
+function measure(path, buffer) {
+	const fd = openSync(path, 'r');
+	const hash = createHash('sha256');
+	let size = 0;
+
+	try {
+		let read;
+		while ((read = readSync(fd, buffer)) > 0) {
+			hash.update(buffer.subarray(0, read));
+			size += read;
+		}
+	} finally {
+		closeSync(fd);
+	}
+
+	return { size, etag: hash.digest('base64url') };
+}
+
+/**
  * A build job's target is a Windows one if it explicitly names a
  * `bun-windows-*` triple, or — when no target is given — the host running
  * the build is Windows itself (Bun then compiles for the host).
@@ -28,7 +67,15 @@ function is_windows_target(target) {
 
 /** @type {import('./index.js').default} */
 export default function plugin(opts = {}) {
-	const { out = 'build', binaryName = 'app', envPrefix = '', compile = true, targets, windows } = opts;
+	const {
+		out = 'build',
+		binaryName = 'app',
+		envPrefix = '',
+		compile = true,
+		precompress = true,
+		targets,
+		windows
+	} = opts;
 
 	return {
 		name: '@sveltejs/adapter-bun',
@@ -43,25 +90,47 @@ export default function plugin(opts = {}) {
 			}
 
 			const tmp = builder.getBuildDirectory('adapter-bun');
-			builder.rimraf(out);
-			builder.rimraf(tmp);
-			builder.mkdirp(tmp);
+			rmSync(out, { force: true, recursive: true });
+			rmSync(tmp, { force: true, recursive: true });
+			mkdirSync(tmp, { recursive: true });
 
 			const base = builder.config.kit.paths.base;
 
+			const client_dir = `${out}/client${base}`;
+			const prerendered_dir = `${out}/prerendered${base}`;
+
 			builder.log.minor('Copying assets');
-			const client_files = builder.writeClient(`${out}/client${base}`);
-			builder.writePrerendered(`${out}/prerendered${base}`);
+			const client_files = builder.writeClient(client_dir);
+			const prerendered_files = builder.writePrerendered(prerendered_dir);
+
+			builder.log.minor(precompress ? 'Compressing assets' : 'Skipping precompression');
+			// SvelteKit 2's `builder.compress` returns nothing; it writes a `.gz` *and* a `.br`
+			// sibling for every file with a compressible extension, which `asset_entry` looks
+			// for on disk.
+			if (precompress) {
+				await Promise.all([builder.compress(client_dir), builder.compress(prerendered_dir)]);
+			}
 
 			builder.log.minor('Building server');
-			builder.writeServer(`${out}/server`);
+			const server_dir = `${out}/server`;
+			builder.writeServer(server_dir);
 
+			// values only known after the build
 			await Bun.write(
-				`${out}/server/manifest.js`,
+				`${server_dir}/manifest.js`,
 				[
 					`export const manifest = ${builder.generateManifest({ relativePath: './' })};`,
-					`export const prerendered = new Set(${JSON.stringify(builder.prerendered.paths)});`
-				].join('\n\n')
+					`export const app_path = manifest.appPath;`,
+					`export const mime_types = manifest.mimeTypes;`
+				].join('\n')
+			);
+			await Bun.write(
+				`${server_dir}/server.js`,
+				[
+					`import { Server } from './index.js';`,
+					`import { manifest } from './manifest.js';`,
+					`export const server = new Server(manifest);`
+				].join('\n')
 			);
 
 			builder.copy(files, out);
@@ -70,29 +139,45 @@ export default function plugin(opts = {}) {
 			// layout under `${out}/client` carries the base prefix, so reconstruct it.
 			const base_segment = base ? `${base.slice(1)}/` : '';
 
-			/** @type {import('./src/codegen.js').AssetEntry[]} */
-			const client_assets = client_files.map((rel) => ({
-				import_path: `./client/${base_segment}${rel}`,
-				key: `/${base_segment}${rel}`
-			}));
+			// one shared buffer for every `measure()` call below, mirroring upstream's `measure_files`
+			const hash_buffer = Buffer.allocUnsafe(64 * 1024);
 
-			// Prerendered pages: URL key may differ from on-disk filename
-			// (e.g. `/foo` → `foo.html`), so use builder.prerendered.pages as source of truth.
-			/** @type {import('./src/codegen.js').AssetEntry[]} */
-			const prerendered_assets = [];
-			for (const [url_path, { file }] of builder.prerendered.pages) {
-				prerendered_assets.push({
-					import_path: `./prerendered/${base_segment}${file}`,
-					key: url_path
-				});
+			/**
+			 * @param {'client' | 'prerendered'} kind - output subdirectory under `out`
+			 * @param {string} rel - path relative to `${out}/${kind}${base}`
+			 * @param {string} key - URL path the asset is served at
+			 * @returns {import('./src/codegen.js').AssetEntry}
+			 */
+			function asset_entry(kind, rel, key) {
+				const path = `${out}/${kind}${base}/${rel}`;
+				const import_path = `./${kind}/${base_segment}${rel}`;
+				const entry = { import_path, key, ...measure(path, hash_buffer) };
+				if (!precompress || !existsSync(`${path}.br`) || !existsSync(`${path}.gz`)) return entry;
+				return {
+					...entry,
+					br: { import_path: `${import_path}.br`, size: statSync(`${path}.br`).size },
+					gz: { import_path: `${import_path}.gz`, size: statSync(`${path}.gz`).size }
+				};
 			}
-			// Non-HTML prerendered assets: URL path mirrors the on-disk layout.
-			for (const [url_path] of builder.prerendered.assets) {
-				prerendered_assets.push({
-					import_path: `./prerendered${url_path}`,
-					key: url_path
-				});
-			}
+
+			// Dotfiles are skipped before they're even imported into entry.js, so they
+			// never end up embedded in the executable.
+			const client_assets = client_files
+				.filter((rel) => !is_hidden(rel))
+				.map((rel) => asset_entry('client', rel, `/${base_segment}${rel}`));
+
+			// Keyed by the exact paths Kit prerendered — pages, assets and redirect stubs —
+			// mirroring upstream adapter-node's `create_prerendered_table`, so a lookup hit is
+			// precisely a prerendered path and every other pathname misses.
+			const prerendered_file_set = new Set(prerendered_files.filter((rel) => !is_hidden(rel)));
+			const prerendered_assets = builder.prerendered.paths.flatMap((url_path) => {
+				// invert `output_filename` in Kit's prerenderer
+				const file = url_path.slice(base.length + 1) || 'index.html';
+				const rel = [file, file + (file.endsWith('/') ? 'index.html' : '.html')].find((f) =>
+					prerendered_file_set.has(f)
+				);
+				return rel ? [asset_entry('prerendered', rel, url_path)] : [];
+			});
 
 			// `name` is already relative to the server output dir (e.g.
 			// `_app/immutable/assets/greeting.hash.txt`).
@@ -103,7 +188,7 @@ export default function plugin(opts = {}) {
 			}));
 
 			const entry_source = generate_entry({
-				server_index_path: './server/index.js',
+				server_path: './server/server.js',
 				manifest_path: './server/manifest.js',
 				serve_path: './serve.js',
 				client_assets,
@@ -113,6 +198,22 @@ export default function plugin(opts = {}) {
 			});
 
 			await Bun.write(`${out}/entry.js`, entry_source);
+
+			// `writeServer` already copied `instrumentation.server.js` into `${out}/server`,
+			// so all that's left is to turn `entry.js` into a facade that imports it before
+			// dynamically importing the real entry (renamed to `start.js`). Bun.build then
+			// compiles the facade, embedding both graphs in the executable.
+			// `builder.instrument` exists since SvelteKit 2.31
+			if (builder.hasServerInstrumentationFile?.() && builder.instrument) {
+				builder.log.minor('Instrumenting entry point');
+				builder.instrument({
+					entrypoint: `${out}/entry.js`,
+					instrumentation: `${server_dir}/instrumentation.server.js`,
+					// the generated entry is a side-effect-only script (`await start({...})`),
+					// so there is nothing to re-export from the renamed module
+					module: { exports: [] }
+				});
+			}
 
 			if (!compile) {
 				builder.log.minor(`Skipping executable compile; run with \`bun run ${out}/entry.js\``);
@@ -210,7 +311,7 @@ export default function plugin(opts = {}) {
 
 			const pkg_file = Bun.file('package.json');
 			if (await pkg_file.exists()) {
-				/** @type {unknown} */
+				/** @type {{ dependencies?: object, devDependencies?: object, optionalDependencies?: object } | null} */
 				let pkg;
 				try {
 					pkg = await pkg_file.json();
@@ -220,17 +321,11 @@ export default function plugin(opts = {}) {
 					);
 					pkg = null;
 				}
-				if (pkg && typeof pkg === 'object') {
+				if (pkg) {
 					const combined = {
-						.../** @type {Record<string, unknown>} */ (
-							/** @type {Record<string, unknown>} */ (pkg).dependencies ?? {}
-						),
-						.../** @type {Record<string, unknown>} */ (
-							/** @type {Record<string, unknown>} */ (pkg).devDependencies ?? {}
-						),
-						.../** @type {Record<string, unknown>} */ (
-							/** @type {Record<string, unknown>} */ (pkg).optionalDependencies ?? {}
-						)
+						...pkg.dependencies,
+						...pkg.devDependencies,
+						...pkg.optionalDependencies
 					};
 					const offenders = NATIVE_ADDON_PACKAGES.filter((name) => name in combined);
 					if (offenders.length > 0) {
@@ -245,7 +340,8 @@ export default function plugin(opts = {}) {
 		},
 
 		supports: {
-			read: () => true
+			read: () => true,
+			instrumentation: () => true
 		}
 	};
 }

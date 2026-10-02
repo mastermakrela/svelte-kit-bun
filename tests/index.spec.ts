@@ -1,7 +1,57 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, extname, join, relative } from 'node:path';
+
+// mirrors kit's own `builder.compress`: only these extensions get gzip/brotli siblings
+const COMPRESSIBLE_EXTENSIONS = [
+	'.html',
+	'.js',
+	'.mjs',
+	'.json',
+	'.css',
+	'.svg',
+	'.xml',
+	'.wasm',
+	'.txt',
+	'.md',
+	'.mdx'
+];
+
+/**
+ * Mirrors `builder.compress`: writes a `.gz` and a `.br` sibling for every
+ * compressible file under `dir` and returns their paths relative to `dir`.
+ */
+function compress_dir(dir: string): string[] {
+	if (!existsSync(dir)) return [];
+	const compressed: string[] = [];
+
+	function walk(current: string, rel: string) {
+		for (const entry of readdirSync(current, { withFileTypes: true })) {
+			const abs = join(current, entry.name);
+			const entry_rel = rel ? `${rel}/${entry.name}` : entry.name;
+			if (entry.isDirectory()) {
+				walk(abs, entry_rel);
+			} else if (COMPRESSIBLE_EXTENSIONS.includes(extname(entry.name))) {
+				const contents = readFileSync(abs);
+				writeFileSync(`${abs}.gz`, Buffer.concat([Buffer.from('GZ:'), contents]));
+				writeFileSync(`${abs}.br`, Buffer.concat([Buffer.from('BR:'), contents]));
+				compressed.push(entry_rel);
+			}
+		}
+	}
+
+	walk(dir, '');
+	return compressed;
+}
 
 vi.mock('../src/windows-brand.js', () => ({ apply_windows_branding: vi.fn() }));
 
@@ -12,6 +62,8 @@ interface BunBuildCall {
 	entrypoints: string[];
 	compile: { outfile: string; target?: string; windows?: Record<string, unknown> };
 	target: string;
+	/** contents of `entrypoints[0]` at the time the build was requested */
+	entry_source?: string;
 }
 
 function create_bun_mock(cwd: string, options: { build_success?: boolean } = {}) {
@@ -48,7 +100,10 @@ function create_bun_mock(cwd: string, options: { build_success?: boolean } = {})
 				}
 			}),
 			build: async (opts: BunBuildCall) => {
-				build_calls.push(opts);
+				build_calls.push({
+					...opts,
+					entry_source: readFileSync(opts.entrypoints[0], 'utf8')
+				});
 				// Mirror real Bun.build: for a `bun-windows-*` target, an `outfile`
 				// with no extension gets `.exe` appended automatically.
 				let compiled_path = opts.compile.outfile;
@@ -71,6 +126,13 @@ function create_bun_mock(cwd: string, options: { build_success?: boolean } = {})
 	};
 }
 
+interface InstrumentCall {
+	entrypoint: string;
+	instrumentation: string;
+	start?: string;
+	module?: { exports: string[] };
+}
+
 interface BuilderMock {
 	builder: {
 		config: { kit: { paths: { base: string }; appDir: string } };
@@ -80,32 +142,36 @@ interface BuilderMock {
 			error: (msg: string) => void;
 		};
 		getBuildDirectory: (name: string) => string;
-		rimraf: (dir: string) => void;
-		mkdirp: (dir: string) => void;
 		writeClient: (dir: string) => string[];
 		writePrerendered: (dir: string) => string[];
 		writeServer: (dir: string) => string[];
+		compress: (dir: string) => Promise<void>;
 		copy: (from: string, to: string) => void;
 		generateManifest: (opts: { relativePath: string }) => string;
+		getAppPath: () => string;
 		findServerAssets: (routes: unknown[]) => string[];
-		prerendered: {
-			paths: string[];
-			pages: Map<string, { file: string }>;
-			assets: Map<string, unknown>;
-		};
+		hasServerInstrumentationFile: () => boolean;
+		instrument: (args: InstrumentCall) => void;
+		prerendered: { paths: string[] };
 		routes: unknown[];
 	};
 	logs: { minor: string[]; warn: string[]; error: string[] };
 	copies: Array<{ from: string; to: string }>;
+	instrument_calls: InstrumentCall[];
 }
 
-function create_builder_mock(cwd: string): BuilderMock {
+function create_builder_mock(
+	cwd: string,
+	{ instrumentation = false }: { instrumentation?: boolean } = {}
+): BuilderMock {
 	const logs = { minor: [] as string[], warn: [] as string[], error: [] as string[] };
 	const copies: Array<{ from: string; to: string }> = [];
+	const instrument_calls: InstrumentCall[] = [];
 
 	return {
 		logs,
 		copies,
+		instrument_calls,
 		builder: {
 			config: { kit: { paths: { base: '' }, appDir: '_app' } },
 			log: {
@@ -114,27 +180,56 @@ function create_builder_mock(cwd: string): BuilderMock {
 				error: (msg: string) => logs.error.push(msg)
 			},
 			getBuildDirectory: (name: string) => join(cwd, '.svelte-kit', name),
-			rimraf: (dir: string) => {
-				try {
-					rmSync(dir, { recursive: true, force: true });
-				} catch {
-					// ignore
-				}
+			// `measure()` reads these files from disk to compute size/etag, so the mock has
+			// to actually write them, not just report their names.
+			writeClient: (dir: string) => {
+				mkdirSync(join(dir, '_app/immutable/chunks'), { recursive: true });
+				writeFileSync(join(dir, 'favicon.png'), 'FAKE_PNG_BYTES');
+				writeFileSync(join(dir, '_app/immutable/chunks/abc.js'), 'console.log("abc");\n');
+				return ['favicon.png', '_app/immutable/chunks/abc.js'];
 			},
-			mkdirp: () => {},
-			writeClient: () => ['favicon.png', '_app/immutable/chunks/abc.js'],
-			writePrerendered: () => [],
-			writeServer: () => [],
+			writePrerendered: (dir: string) => {
+				mkdirSync(dir, { recursive: true });
+				writeFileSync(join(dir, 'about.html'), '<h1>About</h1>\n');
+				return ['about.html'];
+			},
+			// SvelteKit 2's `builder.compress` writes the variants but returns nothing
+			compress: async (dir: string) => {
+				compress_dir(dir);
+			},
+			// kit emits `instrumentation.server.js` into the server output, so it lands in
+			// the adapter's output directory as part of `writeServer`
+			writeServer: (dir: string) => {
+				if (instrumentation) {
+					mkdirSync(dir, { recursive: true });
+					writeFileSync(`${dir}/instrumentation.server.js`, '// instrumentation\n');
+				}
+				return [];
+			},
 			copy: (from: string, to: string) => {
 				copies.push({ from, to });
 			},
-			generateManifest: ({ relativePath }) => `{relative:${JSON.stringify(relativePath)}}`,
+			generateManifest: () => `{ appPath: "_app", mimeTypes: {".png":"image/png"} }`,
+			getAppPath: () => '_app',
 			findServerAssets: () => ['data.bin'],
-			prerendered: {
-				paths: ['/about'],
-				pages: new Map([['/about', { file: 'about.html' }]]),
-				assets: new Map()
+			hasServerInstrumentationFile: () => instrumentation,
+			// mirrors `create_builder`'s implementation: move the entrypoint aside and
+			// replace it with a facade that imports the instrumentation module first
+			instrument: (args: InstrumentCall) => {
+				instrument_calls.push(args);
+				// kit refuses to instrument if any of the files is missing
+				for (const file of [args.entrypoint, args.instrumentation]) {
+					if (!existsSync(file)) throw new Error(`${file} not found`);
+				}
+				const start = args.start ?? join(dirname(args.entrypoint), 'start.js');
+				writeFileSync(start, readFileSync(args.entrypoint, 'utf8'));
+				writeFileSync(
+					args.entrypoint,
+					`import './${relative(dirname(args.entrypoint), args.instrumentation)}';\n` +
+						`const __mod = await import('./${relative(dirname(args.entrypoint), start)}');\n`
+				);
 			},
+			prerendered: { paths: ['/about'] },
 			routes: []
 		}
 	};
@@ -157,6 +252,7 @@ afterEach(() => {
 		// ignore
 	}
 	vi.unstubAllGlobals();
+	vi.unstubAllEnvs();
 });
 
 describe('plugin metadata', () => {
@@ -168,6 +264,74 @@ describe('plugin metadata', () => {
 	test('supports.read returns true', () => {
 		const p = plugin();
 		expect(p.supports?.read?.({ config: {}, route: { id: '/x' } } as never)).toBe(true);
+	});
+
+	// without this, kit refuses to build an app that has `src/instrumentation.server.js`
+	test('supports.instrumentation returns true', () => {
+		const p = plugin();
+		expect(p.supports?.instrumentation?.()).toBe(true);
+	});
+});
+
+describe('server instrumentation', () => {
+	test('does not instrument the entry when the app has no instrumentation file', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, instrument_calls } = create_builder_mock(tmp_cwd);
+		await plugin().adapt(builder as never);
+
+		expect(instrument_calls).toHaveLength(0);
+		expect(mock.build_calls[0].entry_source).toContain('await start({');
+	});
+
+	test('instruments the generated entry with the emitted instrumentation module', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, instrument_calls } = create_builder_mock(tmp_cwd, { instrumentation: true });
+		await plugin({ out: 'build' }).adapt(builder as never);
+
+		expect(instrument_calls).toEqual([
+			{
+				entrypoint: 'build/entry.js',
+				instrumentation: 'build/server/instrumentation.server.js',
+				module: { exports: [] }
+			}
+		]);
+	});
+
+	test('compiles the instrumented facade, not the original entry', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd, { instrumentation: true });
+		await plugin({ out: 'build' }).adapt(builder as never);
+
+		// the entry Bun compiles must load instrumentation before the app, so it has to
+		// be the facade written by `builder.instrument` — i.e. instrumenting happens
+		// before `Bun.build`, and the real entry moved to `start.js`
+		const entry_source = mock.build_calls[0].entry_source!;
+		expect(mock.build_calls[0].entrypoints).toEqual(['build/entry.js']);
+		expect(entry_source).toContain("import './server/instrumentation.server.js';");
+		expect(entry_source.indexOf('instrumentation.server')).toBeLessThan(
+			entry_source.indexOf("await import('./start.js')")
+		);
+		expect(entry_source).not.toContain('await start({');
+		expect(readFileSync(join(tmp_cwd, 'build/start.js'), 'utf8')).toContain('await start({');
+	});
+
+	test('instruments the entry even when compile is disabled', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder, instrument_calls } = create_builder_mock(tmp_cwd, { instrumentation: true });
+		await plugin({ compile: false }).adapt(builder as never);
+
+		expect(instrument_calls).toHaveLength(1);
+		expect(readFileSync(join(tmp_cwd, 'build/entry.js'), 'utf8')).toContain(
+			"import './server/instrumentation.server.js';"
+		);
 	});
 });
 
@@ -188,13 +352,26 @@ describe('adapt hook', () => {
 		await p.adapt(builder as never);
 
 		expect(mock.writes.has('build/entry.js')).toBe(true);
-		expect(mock.writes.has('build/server/manifest.js')).toBe(true);
+		// SvelteKit 2 has no `generateServerInstance`, so the adapter writes the instance itself
+		expect(mock.writes.get('build/server/server.js')).toBe(
+			[
+				`import { Server } from './index.js';`,
+				`import { manifest } from './manifest.js';`,
+				`export const server = new Server(manifest);`
+			].join('\n')
+		);
+
+		const manifest = mock.writes.get('build/server/manifest.js')!;
+		expect(manifest).not.toContain('prerendered');
+		expect(manifest).toContain('export const manifest = { appPath: "_app"');
+		expect(manifest).toContain('export const app_path = manifest.appPath;');
+		expect(manifest).toContain('export const mime_types = manifest.mimeTypes;');
 
 		const entry = mock.writes.get('build/entry.js')!;
-		expect(entry).toContain('import { Server } from "./server/index.js"');
+		expect(entry).toContain('import { server } from "./server/server.js"');
 		expect(entry).toContain('import { start } from "./serve.js"');
 		expect(entry).toContain('import _client_0 from "./client/favicon.png"');
-		expect(entry).toContain('"/about": _prerendered_0');
+		expect(entry).toContain('"/about": { file: _prerendered_0');
 		expect(entry).toContain('"data.bin": _server_0');
 		// server asset name is already relative to the server output dir; no extra prefix
 		expect(entry).toContain('import _server_0 from "./server/data.bin"');
@@ -404,7 +581,10 @@ describe('windows option', () => {
 		writeFileSync(join(tmp_cwd, 'icon.ico'), Buffer.from('FAKE_ICO_BYTES'));
 
 		const { builder } = create_builder_mock(tmp_cwd);
-		const p = plugin({ targets: ['bun-windows-x64'], windows: { icon: join(tmp_cwd, 'icon.ico') } });
+		const p = plugin({
+			targets: ['bun-windows-x64'],
+			windows: { icon: join(tmp_cwd, 'icon.ico') }
+		});
 		await p.adapt(builder as never);
 
 		const [, , icon_arg] = vi.mocked(apply_windows_branding).mock.calls[0];
@@ -486,6 +666,102 @@ describe('windows option', () => {
 	});
 });
 
+describe('precompression', () => {
+	test('embeds br/gz variants and their sizes for compressible assets by default', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		// _app/immutable/chunks/abc.js is .js — compressible
+		expect(entry).toContain(".br\" with { type: 'file' }");
+		expect(entry).toContain(".gz\" with { type: 'file' }");
+		expect(entry).toMatch(/br: \{ file: _client_1_br, size: \d+ \}/);
+		expect(entry).toMatch(/gz: \{ file: _client_1_gz, size: \d+ \}/);
+		// about.html is .html — compressible too
+		expect(entry).toMatch(/br: \{ file: _prerendered_0_br, size: \d+ \}/);
+	});
+
+	test('favicon.png has no extension eligible for compression, so it gets no variants', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).toContain('"/favicon.png": { file: _client_0, size:');
+		expect(entry).not.toContain('_client_0_br');
+		expect(entry).not.toContain('_client_0_gz');
+	});
+
+	test('precompress: false never calls builder.compress and embeds no variants', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const compress_spy = vi.spyOn(builder, 'compress');
+		const p = plugin({ compile: false, precompress: false });
+		await p.adapt(builder as never);
+
+		expect(compress_spy).not.toHaveBeenCalled();
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).not.toContain('.br"');
+		expect(entry).not.toContain('.gz"');
+	});
+
+	test('a prerendered dotfile is not embedded', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		builder.prerendered.paths = ['/about', '/.env'];
+		builder.writePrerendered = (dir) => {
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, 'about.html'), '<h1>About</h1>\n');
+			writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+			return ['about.html', '.env'];
+		};
+
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).not.toContain('.env');
+		expect(entry).not.toContain('/prerendered/.env');
+	});
+
+	test('prerendered paths map to the files Kit wrote for them, whatever kind they are', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		// a page with `trailingSlash: 'always'`, a non-HTML asset, and a redirect stub
+		// (in `paths`, but in neither `pages` nor `assets`)
+		builder.prerendered.paths = ['/docs/', '/data.json', '/moved'];
+		builder.writePrerendered = (dir) => {
+			mkdirSync(join(dir, 'docs'), { recursive: true });
+			writeFileSync(join(dir, 'docs/index.html'), '<h1>Docs</h1>\n');
+			writeFileSync(join(dir, 'data.json'), '{}\n');
+			writeFileSync(join(dir, 'moved.html'), '<meta http-equiv="refresh" content="0;url=/">');
+			return ['docs/index.html', 'data.json', 'moved.html'];
+		};
+
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).toContain('from "./prerendered/docs/index.html"');
+		expect(entry).toContain('"/docs/": { file: _prerendered_0');
+		expect(entry).toContain('"/data.json": { file: _prerendered_1');
+		expect(entry).toContain('"/moved": { file: _prerendered_2');
+	});
+});
+
 describe('base path handling', () => {
 	test('prefixes client/prerendered asset paths with base', async () => {
 		const mock = create_bun_mock(tmp_cwd);
@@ -499,6 +775,21 @@ describe('base path handling', () => {
 
 		const entry = mock.writes.get('build/entry.js')!;
 		expect(entry).toContain('import _client_0 from "./client/my-app/favicon.png"');
-		expect(entry).toContain('"/my-app/favicon.png": _client_0');
+		expect(entry).toContain('"/my-app/favicon.png": { file: _client_0');
+	});
+});
+
+describe('origin handling', () => {
+	test('the origin is never baked into the generated entry (SvelteKit 2 reads ORIGIN at runtime)', async () => {
+		const mock = create_bun_mock(tmp_cwd);
+		vi.stubGlobal('Bun', mock.Bun);
+		vi.stubEnv('ORIGIN', 'https://from-env.example.com');
+
+		const { builder } = create_builder_mock(tmp_cwd);
+		const p = plugin({ compile: false });
+		await p.adapt(builder as never);
+
+		const entry = mock.writes.get('build/entry.js')!;
+		expect(entry).not.toContain('origin');
 	});
 });

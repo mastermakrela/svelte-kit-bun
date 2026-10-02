@@ -1,7 +1,7 @@
 <script>
-	import logo from '$lib/logo.svg';
-	import pixel from '$lib/pixel.png';
-	import greetingUrl from '$lib/greeting.txt?url';
+	import logo from '#lib/logo.svg';
+	import pixel from '#lib/pixel.png';
+	import greetingUrl from '#lib/greeting.txt?url';
 
 	/** @type {{ data: { sampleMd: string } }} */
 	let { data } = $props();
