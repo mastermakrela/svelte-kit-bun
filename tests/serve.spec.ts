@@ -138,7 +138,7 @@ describe('read_config', () => {
 		);
 	});
 
-	test.each(['abc', '-1', '70000', '1.5'])('rejects PORT=%s', (value) => {
+	test.each(['abc', '-1', '70000', '1.5', ''])('rejects PORT=%s', (value) => {
 		expect(() => read_config({ PORT: value }, '', noop)).toThrow(
 			/PORT must be an integer between 0 and 65535/
 		);
@@ -264,7 +264,7 @@ describe('parse_as_bytes', () => {
 		expect(parse_as_bytes(input, 'BODY_SIZE_LIMIT')).toBe(expected);
 	});
 
-	test.each(['abc', '-1', '-1K', 'Kabc', '1.2.3', '-Infinity'] as const)(
+	test.each(['abc', '-1', '-1K', 'Kabc', '1.2.3', '-Infinity', '', 'K', ' '] as const)(
 		'throws on invalid input: %s',
 		(input) => {
 			expect(() => parse_as_bytes(input, 'BODY_SIZE_LIMIT')).toThrow(/BODY_SIZE_LIMIT must be/);

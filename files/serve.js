@@ -112,8 +112,10 @@ export function read_config(
 	 */
 	const read_env = (name) => env[`${env_prefix}${name}`] ?? ENV_DEFAULTS[name];
 
-	const port = Number(read_env('PORT'));
-	if (!Number.isInteger(port) || port < 0 || port > 65535) {
+	// digits only: `Number('')` is 0, so an empty `PORT=` would otherwise bind a random port
+	const port_value = read_env('PORT');
+	const port = Number(port_value);
+	if (!/^\d+$/.test(port_value) || port > 65535) {
 		throw new Error(`${env_prefix}PORT must be an integer between 0 and 65535`);
 	}
 
@@ -704,7 +706,9 @@ export function parse_as_bytes(value, env_name) {
 			M: 1024 * 1024,
 			G: 1024 * 1024 * 1024
 		}[value[value.length - 1]?.toUpperCase() ?? ''] ?? 1;
-	const numeric = Number(multiplier !== 1 ? value.substring(0, value.length - 1) : value);
+	const digits = multiplier !== 1 ? value.substring(0, value.length - 1) : value;
+	// `Number('')` is 0, which would turn an empty `BODY_SIZE_LIMIT=` into a 413 for every body
+	const numeric = digits.trim() === '' ? NaN : Number(digits);
 	// `Infinity` is allowed: it disables the limit, as SvelteKit's own 413 message suggests
 	if (Number.isNaN(numeric) || numeric < 0) {
 		throw new Error(

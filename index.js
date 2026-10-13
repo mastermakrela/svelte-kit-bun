@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readSync, rmSync, statSync } from 'node:fs';
+import { closeSync, openSync, readSync, rmSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { generate_entry } from './src/codegen.js';
@@ -89,10 +89,7 @@ export default function plugin(opts = {}) {
 				);
 			}
 
-			const tmp = builder.getBuildDirectory('adapter-bun');
 			rmSync(out, { force: true, recursive: true });
-			rmSync(tmp, { force: true, recursive: true });
-			mkdirSync(tmp, { recursive: true });
 
 			const base = builder.config.paths.base;
 
