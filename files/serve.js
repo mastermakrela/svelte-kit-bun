@@ -107,10 +107,13 @@ export function read_config(
 	validate_env(env, env_prefix, warn);
 
 	/**
+	 * An empty value counts as unset: `PORT=` would otherwise parse as `0` and bind a
+	 * random port.
+	 *
 	 * @param {keyof typeof ENV_DEFAULTS} name
 	 * @returns {string}
 	 */
-	const read_env = (name) => env[`${env_prefix}${name}`] ?? ENV_DEFAULTS[name];
+	const read_env = (name) => env[`${env_prefix}${name}`] || ENV_DEFAULTS[name];
 
 	const port = Number(read_env('PORT'));
 	if (!Number.isInteger(port) || port < 0 || port > 65535) {
@@ -178,6 +181,7 @@ const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
  * @property {string} file  $bunfs path
  * @property {number} size
  * @property {string} etag  bare sha256/base64url content hash, computed at build time
+ * @property {number} mtime  modification time in ms, recorded at build time (`$bunfs` has none)
  * @property {CompressedVariant} [br]
  * @property {CompressedVariant} [gz]
  */
@@ -187,6 +191,7 @@ const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
  * @property {string} file
  * @property {number} size
  * @property {string} etag
+ * @property {number} mtime
  * @property {string} [type]
  * @property {string} [cache_control]
  * @property {CompressedVariant} [br]
@@ -303,14 +308,22 @@ export function create_file_map({ app_path, mime_types, client_assets, prerender
 		if (without_slash && !files.has(without_slash)) files.set(without_slash, asset);
 	}
 
-	for (const [key, raw] of Object.entries(prerendered_assets)) {
+	// Kit records prerendered paths as `decodeURI(pathname)`, which leaves escapes of
+	// reserved characters (`%23`, `%2B`, `%40`, …) encoded; decode those, except `%2F`,
+	// so the keys line up with `decode_pathname`'s output
+	/** @param {string} path */
+	const prerendered_key = (path) => path.replace(/%(2[346BC]|3[ABDF]|40)/gi, decodeURIComponent);
+
+	for (const [path, raw] of Object.entries(prerendered_assets)) {
+		const key = prerendered_key(path);
 		if (!files.has(key)) files.set(key, to_asset(key, raw));
 	}
 
-	for (const key of Object.keys(prerendered_assets)) {
-		const inverted = key.at(-1) === '/' ? key.slice(0, -1) : key + '/';
-		if (inverted && !files.has(inverted)) {
-			files.set(inverted, { location: relative_pathname(inverted, key) });
+	for (const path of Object.keys(prerendered_assets)) {
+		const inverted = path.at(-1) === '/' ? path.slice(0, -1) : path + '/';
+		const key = prerendered_key(inverted);
+		if (inverted && !files.has(key)) {
+			files.set(key, { location: relative_pathname(inverted, path) });
 		}
 	}
 
@@ -421,7 +434,7 @@ export async function start({
 			}
 
 			const final_request =
-				`${url.protocol}//${url.host}` === effective_origin
+				url.origin === effective_origin
 					? request
 					: new Request(`${effective_origin}${url.pathname}${url.search}`, request);
 
@@ -435,7 +448,7 @@ export async function start({
 			// `cache-control`), which breaks streaming responses like server-sent events.
 			// `X-Accel-Buffering: no` opts out of that buffering and is a no-op on proxies
 			// that don't recognise it. See https://github.com/sveltejs/kit/issues/15790
-			if (response.headers.get('content-type') === 'text/event-stream') {
+			if (response.headers.get('content-type')?.startsWith('text/event-stream')) {
 				response.headers.set('x-accel-buffering', 'no');
 
 				// A server-sent-events stream may stay quiet for longer than
@@ -564,10 +577,9 @@ export function resolve_origin(
 		? normalise_header(protocol_header, headers.get(protocol_header))
 		: undefined;
 	const protocol = decodeURIComponent(raw_protocol || 'https');
-	// prevent host-injection through the protocol header (RFC 7230 §5.5)
-	if (protocol.includes(':')) {
+	if (!/^https?$/i.test(protocol)) {
 		throw new Error(
-			`The ${protocol_header} header specified '${protocol}' which is invalid because it includes \`:\`. It should only contain the protocol scheme (e.g. \`https\`)`
+			`The ${protocol_header} header specified '${protocol}' which is an invalid protocol scheme. It should only contain the protocol scheme (e.g. \`https\`)`
 		);
 	}
 
@@ -580,6 +592,13 @@ export function resolve_origin(
 		const header_names = host_header ? `${host_header} or host` : 'host';
 		throw new Error(
 			`Could not determine host. The request must have a value provided by the ${header_names} header`
+		);
+	}
+	// a path, query, fragment or userinfo would otherwise end up in the request URL
+	// SvelteKit routes on (`example.com/read?` + `/nothing-here` serving `/read`)
+	if (/[/?#@\\]/.test(host)) {
+		throw new Error(
+			`The ${host_header} header specified '${host}' which is an invalid host. It should only contain the host and an optional port (e.g. \`example.com:8443\`)`
 		);
 	}
 
@@ -596,19 +615,20 @@ export function resolve_origin(
 		}
 	}
 
-	return port ? `${protocol}://${host}:${port}` : `${protocol}://${host}`;
+	// parsed here, inside the caller's 400 handling, so e.g. a port above 65535 is a bad
+	// request; `.origin` also canonicalizes case and default ports for the caller's comparison
+	return new URL(port ? `${protocol}://${host}:${port}` : `${protocol}://${host}`).origin;
 }
 
 /**
- * Decode a request pathname the way SvelteKit's router does: split on the literal `%25`
- * (a percent-encoded `%`) and `decodeURI` each piece separately, rather than decoding the
- * whole pathname in one pass. That keeps reserved characters like `%2F` encoded (`decodeURI`
- * already leaves them alone), and — because the split removes every `%25` *before*
- * `decodeURI` runs — a literal `%25` in the path stays `%25` instead of `decodeURI` turning
- * it into a bare `%`, while any other `%XX` escape in the surrounding pieces still decodes
- * normally. Mirrors `decode_pathname` in `@sveltejs/kit/src/utils/url.js` and upstream
- * adapter-node's `static.js#split_url`. A malformed `%` escape is left undecoded, same as
- * upstream.
+ * Decode a request pathname for the static asset lookup, whose keys are raw file paths
+ * (`/100%.txt`, `/a#b.txt`): every `/`-separated segment is `decodeURIComponent`-ed once,
+ * so `%25`, `%23`, `%3F` and `%2B` (in either hex case) match the names they spell.
+ * SvelteKit's router keeps `%25` and reserved escapes encoded because route params get
+ * decoded again later; nothing decodes a static key twice, so that reason doesn't apply
+ * here. Its other reason does: a segment that would decode to contain `/` (`%2F`) is left
+ * encoded, so it can never be mistaken for a nested file. A malformed `%` escape leaves the
+ * pathname undecoded. SSR still receives the original, undecoded pathname.
  *
  * @param {string} pathname
  * @returns {string}
@@ -616,7 +636,13 @@ export function resolve_origin(
 export function decode_pathname(pathname) {
 	if (!pathname.includes('%')) return pathname;
 	try {
-		return pathname.split('%25').map(decodeURI).join('%25');
+		return pathname
+			.split('/')
+			.map((segment) => {
+				const decoded = decodeURIComponent(segment);
+				return decoded.includes('/') ? segment : decoded;
+			})
+			.join('/');
 	} catch {
 		return pathname;
 	}
@@ -626,7 +652,8 @@ export function decode_pathname(pathname) {
  * Content type for a served asset, taken from SvelteKit's manifest metadata so that
  * types SvelteKit knows about (e.g. `.ico`, `image/jxl`) are used rather than only
  * Bun's own extension mapping. Returns `undefined` when the manifest has no entry,
- * in which case `Bun.file(...).type` is used as the fallback.
+ * in which case `Bun.file(...).type` is used as the fallback. Text and JSON types are
+ * declared UTF-8, as upstream adapter-bun's `Bun.file(...).type` does for the common ones.
  *
  * @param {string} url_path
  * @param {Record<string, string>} mime_types  `builder.mimeTypes`
@@ -640,7 +667,7 @@ export function mime_type(url_path, mime_types) {
 	const type = mime_types[filename.slice(dot)];
 	if (!type) return undefined;
 
-	return type === 'text/html' ? 'text/html;charset=utf-8' : type;
+	return /^text\/|^application\/(.+\+)?json$/.test(type) ? `${type};charset=utf-8` : type;
 }
 
 /**
@@ -734,7 +761,9 @@ export function make_redirect_handler(location) {
 
 /**
  * Handler for one static asset: GET/HEAD only (every other method, including
- * OPTIONS, gets 405), conditional requests via `ETag`/`If-None-Match`, and
+ * OPTIONS, gets 405), conditional requests via `ETag`/`If-None-Match` and
+ * `Last-Modified`/`If-Modified-Since` (If-None-Match wins when both are sent, per
+ * RFC 9110 §13.1.3, mirroring upstream adapter-bun's `is_fresh`), and
  * `Range` requests exactly like upstream adapter-node's `serve_static` — `end`
  * beyond `size - 1` is clamped rather than rejected, `bytes=-N` is a suffix
  * range, an unbounded `bytes=` (neither bound given) is ignored and falls
@@ -754,10 +783,14 @@ export function make_asset_handler({
 	type,
 	cache_control,
 	etag: hash,
+	mtime,
 	br,
 	gz
 }) {
 	const file = Bun.file(bunfs_path);
+	const last_modified = new Date(mtime).toUTCString();
+	// HTTP dates have whole-second precision
+	const mtime_s = Math.trunc(mtime / 1000);
 	const content_type = type ?? file.type;
 	const etag = `"${hash}"`;
 	const has_variants = Boolean(br || gz);
@@ -795,11 +828,16 @@ export function make_asset_handler({
 		}
 
 		/** @type {Record<string, string>} */
-		const base_headers = { etag: serve_etag };
+		const base_headers = { etag: serve_etag, 'last-modified': last_modified };
 		if (has_variants) base_headers.vary = 'Accept-Encoding';
 		if (cache_control) base_headers['cache-control'] = cache_control;
 
-		if (etag_matches(request.headers.get('if-none-match'), serve_etag)) {
+		const if_none_match = request.headers.get('if-none-match');
+		const fresh =
+			if_none_match === null
+				? mtime_s <= Math.trunc(Date.parse(request.headers.get('if-modified-since') ?? '') / 1000)
+				: etag_matches(if_none_match, serve_etag);
+		if (fresh) {
 			return new Response(null, { status: 304, headers: base_headers });
 		}
 

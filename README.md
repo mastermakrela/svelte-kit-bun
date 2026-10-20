@@ -69,7 +69,7 @@ adapter({ precompress: false });
 
 ### Environment variables
 
-The built app reads exactly these variables at startup — nothing else:
+The built app reads exactly these variables at startup — nothing else. An empty value (`PORT=`) is the same as leaving the variable unset:
 
 | Variable                  | Default   | Description                                                                                                                                            |
 | ------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -123,7 +123,7 @@ sveltekit({
 
 There is no `ORIGIN` environment variable (SvelteKit 3 removed it from the adapter contract). When `paths.origin` is not set, the origin is always derived from the incoming request, corrected by the `PROTOCOL_HEADER`, `HOST_HEADER`, and `PORT_HEADER` environment variables when running behind a reverse proxy. An unconfigured `PROTOCOL_HEADER` (or one absent from a given request) defaults the derived protocol to `https`, since an app without that header configured is assumed to sit behind a TLS-terminating proxy rather than to be served over plain `http`.
 
-A malformed or ambiguous proxy header — a `PROTOCOL_HEADER` value containing `:`, a non-numeric `PORT_HEADER` value, or a comma-joined value for any of `PROTOCOL_HEADER`/`HOST_HEADER`/`PORT_HEADER` (each expects exactly one value; Bun already joins a repeated header with `, `) — fails the request with `400 Bad Request` and logs `Could not determine request origin: …` to stderr, rather than falling through to a generic `500`.
+A malformed or ambiguous proxy header — a `PROTOCOL_HEADER` value other than `http` or `https`, a `HOST_HEADER` value that is more than a bare `host[:port]` (a `/`, `?`, `#`, `@` or `\`), a non-numeric `PORT_HEADER` value, a combination that doesn't parse as an origin (e.g. a port above 65535), or a comma-joined value for any of `PROTOCOL_HEADER`/`HOST_HEADER`/`PORT_HEADER` (each expects exactly one value; Bun already joins a repeated header with `, `) — fails the request with `400 Bad Request` and logs `Could not determine request origin: …` to stderr, rather than falling through to a generic `500`.
 
 ### Server instrumentation
 
@@ -147,16 +147,17 @@ Two Bun-specific caveats:
 
 Embedded assets are served with the same semantics as `@sveltejs/adapter-node`:
 
-- `content-type` comes from SvelteKit's MIME metadata (`builder.mimeTypes`, recorded at build time), so types SvelteKit knows about are used rather than only Bun's extension mapping; `text/html` gains `;charset=utf-8`.
+- `content-type` comes from SvelteKit's MIME metadata (`builder.mimeTypes`, recorded at build time), so types SvelteKit knows about are used rather than only Bun's extension mapping; `text/*`, `application/json` and `application/*+json` types gain `;charset=utf-8`.
 - Hashed client build output under `/{appPath}/immutable/` is served with `cache-control: public,max-age=31536000,immutable`. Other assets (e.g. `_app/version.json`, files from `static/`) are not.
-- Every static response carries an `ETag` (sha256/base64url hash of the file contents, computed at build time). A matching `If-None-Match` (exact, weak `W/"..."`, or `*`) returns `304 Not Modified` with only the `etag` and `cache-control` headers.
+- Every static response carries an `ETag` (sha256/base64url hash of the file contents) and a `Last-Modified` (the file's mtime in the build output), both recorded at build time. A matching `If-None-Match` (exact, weak `W/"..."`, or `*`), or — only when no `If-None-Match` is sent, per RFC 9110 — an `If-Modified-Since` at or after `Last-Modified`, returns `304 Not Modified` with only the `etag`, `last-modified` and `cache-control` headers.
 - When `precompress` produced a gzip/brotli variant for an asset (see [Precompression](#precompression)), the response negotiates `Accept-Encoding` (brotli preferred over gzip, `q` values honored, `*` as a fallback weight): a chosen variant is served with `content-encoding: gzip`/`br`, its own size, and an etag suffixed `.gz`/`.br`; the response also carries `Vary: Accept-Encoding`. Range and conditional (`If-None-Match`/`If-Range`) requests apply to whichever representation — raw or variant — was negotiated.
 - `Range` requests are supported: `bytes=start-end`, an open-ended `bytes=start-`, and a suffix `bytes=-N` are all honored; an `end` past the end of the file is clamped to `size - 1` rather than rejected; a `Range` with neither bound (`bytes=-`) is ignored and falls through to a full response; `start >= size` or `start > end` returns `416 Range Not Satisfiable` with `content-range: bytes */size`. `If-Range` is honored — the range is only served when `If-Range` is absent or matches the current `ETag`; otherwise the full current representation is returned.
 - Every method other than `GET`/`HEAD` — including `OPTIONS` — gets `405 Method Not Allowed` with `allow: GET, HEAD`.
+- File names containing characters that must be percent-encoded in a URL (`%`, `#`, `?`, spaces, non-ASCII) are matched in their encoded form (`/100%25.txt` serves `100%.txt`), as are optionally-encoded ones like `+` (`%2B`), in either hex case. An encoded slash (`%2F`) never matches a file in a subdirectory.
 - Dotfiles under `static/` (any path segment starting with `.`) are not embedded in the executable or served, except under `.well-known/`.
 - A `.html` file in `static/` gets clean-URL aliases: `/foo` and `/foo/` resolve to `foo.html`, or to `foo/index.html` when only that exists. An exact file always wins over an alias, and when both `foo.html` and `foo/index.html` exist, `foo.html` claims the aliases.
 - Every path SvelteKit prerendered — pages, non-HTML assets, and redirects (served as the stub page SvelteKit writes for them) — is matched only at that exact path. Its other trailing-slash form gets a `308` with a **relative** `location` (`../about`, or `./about/` the other way round), so it keeps working behind a proxy that strips a mount prefix; the query string is preserved, and a non-`GET`/`HEAD` request gets `405` like any other static path.
-- Responses whose `content-type` is exactly `text/event-stream` get `x-accel-buffering: no`, which stops nginx-style proxies from buffering server-sent events.
+- Responses whose `content-type` is `text/event-stream` (with or without parameters such as `charset=utf-8`) get `x-accel-buffering: no`, which stops nginx-style proxies from buffering server-sent events.
 
 ### Windows executable icon and metadata
 

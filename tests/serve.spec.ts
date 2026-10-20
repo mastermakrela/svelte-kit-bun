@@ -165,6 +165,11 @@ describe('read_config', () => {
 		);
 	});
 
+	test('an empty value is the same as unset', () => {
+		const empty = Object.fromEntries([...SUPPORTED_ENV_VARS].map((name) => [`MY_APP_${name}`, '']));
+		expect(read_config(empty, 'MY_APP_', noop)).toEqual(read_config({}, 'MY_APP_', noop));
+	});
+
 	test('SOCKET_PATH defaults to empty (no socket configured)', () => {
 		expect(read_config({}, '', noop).socket_path).toBe('');
 	});
@@ -204,11 +209,16 @@ describe('mime_type', () => {
 		'.css': 'text/css',
 		'.html': 'text/html',
 		'.jxl': 'image/jxl',
-		'.ico': 'image/x-icon'
+		'.ico': 'image/x-icon',
+		'.json': 'application/json',
+		'.webmanifest': 'application/manifest+json',
+		'.svg': 'image/svg+xml'
 	};
 
 	test('resolves the manifest type for a known extension', () => {
-		expect(mime_type('/_app/immutable/assets/app.abc.css', mime_types)).toBe('text/css');
+		expect(mime_type('/_app/immutable/assets/app.abc.css', mime_types)).toBe(
+			'text/css;charset=utf-8'
+		);
 	});
 
 	test('prefers manifest types over Bun’s extension mapping', () => {
@@ -216,8 +226,13 @@ describe('mime_type', () => {
 		expect(mime_type('/favicon.ico', mime_types)).toBe('image/x-icon');
 	});
 
-	test('appends charset to text/html', () => {
+	test('appends charset to text and JSON types only', () => {
 		expect(mime_type('/page.html', mime_types)).toBe('text/html;charset=utf-8');
+		expect(mime_type('/data.json', mime_types)).toBe('application/json;charset=utf-8');
+		expect(mime_type('/app.webmanifest', mime_types)).toBe(
+			'application/manifest+json;charset=utf-8'
+		);
+		expect(mime_type('/logo.svg', mime_types)).toBe('image/svg+xml');
 	});
 
 	test('returns undefined for unknown or extension-less paths', () => {
@@ -392,15 +407,49 @@ describe('resolve_origin', () => {
 		).toBe('https://localhost:3000');
 	});
 
-	test('throws when protocol_header value contains a colon (host-injection guard)', () => {
-		const req = make_request({ 'x-forwarded-proto': 'https://evil.com' });
+	test.each(['https://evil.com', 'ftp', 'javascript'])(
+		'throws when protocol_header is %s rather than http or https',
+		(value) => {
+			const req = make_request({ 'x-forwarded-proto': value });
+			const url = new URL(req.url);
+			expect(() =>
+				resolve_origin(req, url, {
+					...base_cfg,
+					protocol_header: 'x-forwarded-proto'
+				})
+			).toThrow(/invalid protocol scheme/);
+		}
+	);
+
+	test('accepts http in any case and canonicalizes the origin', () => {
+		const req = make_request({ 'x-forwarded-proto': 'HTTP', 'x-forwarded-host': 'Example.COM:80' });
 		const url = new URL(req.url);
-		expect(() =>
+		expect(
 			resolve_origin(req, url, {
 				...base_cfg,
-				protocol_header: 'x-forwarded-proto'
+				protocol_header: 'x-forwarded-proto',
+				host_header: 'x-forwarded-host'
 			})
-		).toThrow(/invalid because it includes/);
+		).toBe('http://example.com');
+	});
+
+	test.each(['example.com/read?', 'example.com?x', 'example.com#x', 'user@example.com', 'a\\b'])(
+		'throws when host_header is %s rather than a bare host[:port]',
+		(value) => {
+			const req = make_request({ 'x-forwarded-host': value });
+			const url = new URL(req.url);
+			expect(() =>
+				resolve_origin(req, url, { ...base_cfg, host_header: 'x-forwarded-host' })
+			).toThrow(/invalid host/);
+		}
+	);
+
+	test('throws when the resulting origin cannot be parsed', () => {
+		const req = make_request({ 'x-forwarded-port': '99999' });
+		const url = new URL(req.url);
+		expect(() =>
+			resolve_origin(req, url, { ...base_cfg, port_header: 'x-forwarded-port' })
+		).toThrow();
 	});
 
 	test('throws when port_header value is not a number', () => {
@@ -478,10 +527,14 @@ describe('decode_pathname', () => {
 		expect(decode_pathname('/a%2Fb')).toBe('/a%2Fb');
 	});
 
-	test('keeps a literal %25 encoded while still decoding neighbouring escapes', () => {
-		// splitting on the literal '%25' before decoding is what keeps it from being
-		// turned into a bare '%' — plain decodeURIComponent would decode it
-		expect(decode_pathname('/100%25off%20now')).toBe('/100%25off now');
+	test('decodes escapes that spell file-name characters, %25 included', () => {
+		expect(decode_pathname('/100%25off%20now')).toBe('/100%off now');
+		expect(decode_pathname('/a%23b%3Fc%2Bd')).toBe('/a#b?c+d');
+		expect(decode_pathname('/caf%c3%a9')).toBe('/café');
+	});
+
+	test('decodes each segment once, so a double-encoded escape stays single-encoded', () => {
+		expect(decode_pathname('/100%2525.txt')).toBe('/100%25.txt');
 	});
 
 	test('a malformed % escape is left undecoded rather than throwing', () => {
@@ -558,6 +611,9 @@ describe('make_asset_handler', () => {
 	const FILE_SIZE = 1000;
 	const ETAG = 'abc123';
 	const QUOTED_ETAG = `"${ETAG}"`;
+	// sub-second part on purpose: HTTP dates only carry whole seconds
+	const MTIME = Date.UTC(2026, 9, 20, 12, 0, 0, 500);
+	const LAST_MODIFIED = 'Tue, 20 Oct 2026 12:00:00 GMT';
 
 	beforeEach(() => {
 		vi.stubGlobal('Bun', {
@@ -575,7 +631,7 @@ describe('make_asset_handler', () => {
 
 	/** Build a full `Asset` for `make_asset_handler`, overriding only what a test cares about. */
 	function asset(overrides: Partial<Parameters<typeof make_asset_handler>[0]> = {}) {
-		return { file: '/bunfs/favicon.png', size: FILE_SIZE, etag: ETAG, ...overrides };
+		return { file: '/bunfs/favicon.png', size: FILE_SIZE, etag: ETAG, mtime: MTIME, ...overrides };
 	}
 
 	test('GET returns 200 with body, etag, and headers', async () => {
@@ -586,6 +642,7 @@ describe('make_asset_handler', () => {
 		expect(res.headers.get('content-length')).toBe(String(FILE_SIZE));
 		expect(res.headers.get('accept-ranges')).toBe('bytes');
 		expect(res.headers.get('etag')).toBe(QUOTED_ETAG);
+		expect(res.headers.get('last-modified')).toBe(LAST_MODIFIED);
 		expect(res.body).not.toBeNull();
 	});
 
@@ -747,7 +804,7 @@ describe('make_asset_handler', () => {
 	});
 
 	describe('conditional requests (If-None-Match)', () => {
-		test('an exact matching etag returns 304 with etag + cache-control only', () => {
+		test('an exact matching etag returns 304 with validators + cache-control only', () => {
 			const handler = make_asset_handler(
 				asset({ cache_control: 'public,max-age=31536000,immutable' })
 			);
@@ -758,6 +815,7 @@ describe('make_asset_handler', () => {
 			);
 			expect(res.status).toBe(304);
 			expect(res.headers.get('etag')).toBe(QUOTED_ETAG);
+			expect(res.headers.get('last-modified')).toBe(LAST_MODIFIED);
 			expect(res.headers.get('cache-control')).toBe('public,max-age=31536000,immutable');
 			expect(res.headers.get('content-length')).toBeNull();
 			expect(res.headers.get('content-type')).toBeNull();
@@ -810,6 +868,31 @@ describe('make_asset_handler', () => {
 			);
 			expect(res.status).toBe(304);
 			expect(res.body).toBeNull();
+		});
+	});
+
+	describe('conditional requests (If-Modified-Since)', () => {
+		const get = (headers: Record<string, string>) =>
+			make_asset_handler(asset())(new Request('http://localhost/favicon.png', { headers }));
+
+		test('a date at or after Last-Modified returns 304', () => {
+			expect(get({ 'if-modified-since': LAST_MODIFIED }).status).toBe(304);
+			expect(get({ 'if-modified-since': 'Wed, 21 Oct 2026 00:00:00 GMT' }).status).toBe(304);
+		});
+
+		test('an earlier or unparseable date returns the full 200', () => {
+			expect(get({ 'if-modified-since': 'Tue, 20 Oct 2026 11:59:59 GMT' }).status).toBe(200);
+			expect(get({ 'if-modified-since': 'yesterday' }).status).toBe(200);
+		});
+
+		test('If-None-Match takes precedence over If-Modified-Since (RFC 9110 §13.1.3)', () => {
+			expect(get({ 'if-none-match': '"stale"', 'if-modified-since': LAST_MODIFIED }).status).toBe(
+				200
+			);
+			expect(
+				get({ 'if-none-match': QUOTED_ETAG, 'if-modified-since': 'Thu, 01 Jan 1970 00:00:00 GMT' })
+					.status
+			).toBe(304);
 		});
 	});
 
@@ -1043,7 +1126,7 @@ describe('etag_matches', () => {
 
 /** `size` is derived from the bunfs path so a response identifies which file its handler was built from. */
 function built_asset(file: string) {
-	return { file, size: file.length, etag: file };
+	return { file, size: file.length, etag: file, mtime: 0 };
 }
 
 describe('create_file_map', () => {
@@ -1296,6 +1379,64 @@ describe('start', () => {
 	});
 
 	describe('static asset table', () => {
+		test('static file names with escaped characters match, but %2F never names a nested file', async () => {
+			runtime = await start_runtime({
+				client_assets: {
+					'/100%.txt': built_asset('/bunfs/100%.txt'),
+					'/a#b.txt': built_asset('/bunfs/a#b.txt'),
+					'/a?b.txt': built_asset('/bunfs/a?b.txt'),
+					'/a+b.txt': built_asset('/bunfs/a+b.txt'),
+					'/café.txt': built_asset('/bunfs/café.txt'),
+					'/dir/x.txt': built_asset('/bunfs/dir/x.txt')
+				}
+			});
+
+			const served = async (path: string) => {
+				const before = runtime!.responded.length;
+				await runtime!.serve.fetch(new Request(`http://localhost${path}`), runtime!.srv);
+				return runtime!.responded.length === before;
+			};
+
+			for (const path of [
+				'/100%25.txt',
+				'/a%23b.txt',
+				'/a%3Fb.txt',
+				'/a%2Bb.txt',
+				'/a%2bb.txt',
+				'/a+b.txt',
+				'/caf%C3%A9.txt',
+				'/caf%c3%a9.txt',
+				'/dir/x.txt'
+			]) {
+				expect(await served(path), path).toBe(true);
+			}
+			expect(await served('/dir%2Fx.txt')).toBe(false);
+		});
+
+		test('prerendered paths with reserved escapes (as Kit records them) still match', async () => {
+			// Kit keys prerendered paths by `decodeURI(pathname)`, which keeps `%2B`, `%23`, … encoded
+			runtime = await start_runtime({
+				prerendered_assets: {
+					'/tags/c%2B%2B': built_asset('/bunfs/c++.html'),
+					'/a%23b': built_asset('/bunfs/a#b.html'),
+					'/x%2Fy': built_asset('/bunfs/x-y.html'),
+					'/100%': built_asset('/bunfs/100.html')
+				}
+			});
+
+			const fetch_path = (path: string) =>
+				runtime!.serve.fetch(new Request(`http://localhost${path}`), runtime!.srv);
+
+			for (const path of ['/tags/c%2B%2B', '/tags/c++', '/a%23b', '/x%2Fy', '/100%25']) {
+				expect((await fetch_path(path)).status, path).toBe(200);
+			}
+			expect(runtime.responded).toHaveLength(0);
+
+			const redirect = await fetch_path('/a%23b/');
+			expect(redirect.status).toBe(308);
+			expect(redirect.headers.get('location')).toBe('../a%23b');
+		});
+
 		test('immutable client assets are cached forever, everything else is not', async () => {
 			runtime = await start_runtime({
 				client_assets: {
@@ -1566,7 +1707,7 @@ describe('start', () => {
 			expect(runtime.responded).toHaveLength(0);
 			expect(calls.map((call) => call[0])).toContainEqual(
 				expect.stringMatching(
-					/Could not determine request origin: .*includes `:`.*It should only contain the protocol scheme/
+					/Could not determine request origin: .*invalid protocol scheme.*It should only contain the protocol scheme/
 				)
 			);
 		});
@@ -1600,6 +1741,40 @@ describe('start', () => {
 			);
 		});
 
+		test.each([
+			['x-forwarded-host', 'example.com/read?'],
+			['x-forwarded-proto', 'ftp'],
+			['x-forwarded-port', '99999']
+		])('an invalid %s (%s) is a 400, not served or a 500', async (header, value) => {
+			vi.stubEnv('HOST_HEADER', 'x-forwarded-host');
+			vi.stubEnv('PROTOCOL_HEADER', 'x-forwarded-proto');
+			vi.stubEnv('PORT_HEADER', 'x-forwarded-port');
+			runtime = await start_runtime();
+
+			// see above for why `process.stderr.write` is reassigned instead of spied on
+			const original_write = process.stderr.write;
+			const calls: unknown[] = [];
+			process.stderr.write = ((message: unknown) => {
+				calls.push(message);
+				return true;
+			}) as typeof process.stderr.write;
+			let res: Response;
+			try {
+				res = await runtime.serve.fetch(
+					new Request('http://localhost/nothing-here', { headers: { [header]: value } }),
+					runtime.srv
+				);
+			} finally {
+				process.stderr.write = original_write;
+			}
+
+			expect(res.status).toBe(400);
+			expect(runtime.responded).toHaveLength(0);
+			expect(calls).toContainEqual(
+				expect.stringMatching(/^adapter-bun: Could not determine request origin: /)
+			);
+		});
+
 		test('SSE responses opt out of proxy buffering', async () => {
 			runtime = await start_runtime({
 				respond: async () =>
@@ -1620,6 +1795,21 @@ describe('start', () => {
 
 			const request = new Request('http://localhost/sse');
 			await runtime.serve.fetch(request, runtime.srv);
+			expect(runtime.timeouts).toEqual([{ request, seconds: 0 }]);
+		});
+
+		test('SSE detection ignores media type parameters such as charset', async () => {
+			vi.stubEnv('CONNECTION_IDLE_TIMEOUT', '30');
+			runtime = await start_runtime({
+				respond: async () =>
+					new Response('data: hi\n\n', {
+						headers: { 'content-type': 'text/event-stream; charset=utf-8' }
+					})
+			});
+
+			const request = new Request('http://localhost/sse');
+			const res = await runtime.serve.fetch(request, runtime.srv);
+			expect(res.headers.get('x-accel-buffering')).toBe('no');
 			expect(runtime.timeouts).toEqual([{ request, seconds: 0 }]);
 		});
 
