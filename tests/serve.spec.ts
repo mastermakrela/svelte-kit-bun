@@ -209,11 +209,16 @@ describe('mime_type', () => {
 		'.css': 'text/css',
 		'.html': 'text/html',
 		'.jxl': 'image/jxl',
-		'.ico': 'image/x-icon'
+		'.ico': 'image/x-icon',
+		'.json': 'application/json',
+		'.webmanifest': 'application/manifest+json',
+		'.svg': 'image/svg+xml'
 	};
 
 	test('resolves the manifest type for a known extension', () => {
-		expect(mime_type('/_app/immutable/assets/app.abc.css', mime_types)).toBe('text/css');
+		expect(mime_type('/_app/immutable/assets/app.abc.css', mime_types)).toBe(
+			'text/css;charset=utf-8'
+		);
 	});
 
 	test('prefers manifest types over Bun’s extension mapping', () => {
@@ -221,8 +226,13 @@ describe('mime_type', () => {
 		expect(mime_type('/favicon.ico', mime_types)).toBe('image/x-icon');
 	});
 
-	test('appends charset to text/html', () => {
+	test('appends charset to text and JSON types only', () => {
 		expect(mime_type('/page.html', mime_types)).toBe('text/html;charset=utf-8');
+		expect(mime_type('/data.json', mime_types)).toBe('application/json;charset=utf-8');
+		expect(mime_type('/app.webmanifest', mime_types)).toBe(
+			'application/manifest+json;charset=utf-8'
+		);
+		expect(mime_type('/logo.svg', mime_types)).toBe('image/svg+xml');
 	});
 
 	test('returns undefined for unknown or extension-less paths', () => {

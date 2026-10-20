@@ -147,7 +147,7 @@ Two Bun-specific caveats:
 
 Embedded assets are served with the same semantics as `@sveltejs/adapter-node`:
 
-- `content-type` comes from SvelteKit's MIME metadata (`builder.mimeTypes`, recorded at build time), so types SvelteKit knows about are used rather than only Bun's extension mapping; `text/html` gains `;charset=utf-8`.
+- `content-type` comes from SvelteKit's MIME metadata (`builder.mimeTypes`, recorded at build time), so types SvelteKit knows about are used rather than only Bun's extension mapping; `text/*`, `application/json` and `application/*+json` types gain `;charset=utf-8`.
 - Hashed client build output under `/{appPath}/immutable/` is served with `cache-control: public,max-age=31536000,immutable`. Other assets (e.g. `_app/version.json`, files from `static/`) are not.
 - Every static response carries an `ETag` (sha256/base64url hash of the file contents, computed at build time). A matching `If-None-Match` (exact, weak `W/"..."`, or `*`) returns `304 Not Modified` with only the `etag` and `cache-control` headers.
 - When `precompress` produced a gzip/brotli variant for an asset (see [Precompression](#precompression)), the response negotiates `Accept-Encoding` (brotli preferred over gzip, `q` values honored, `*` as a fallback weight): a chosen variant is served with `content-encoding: gzip`/`br`, its own size, and an etag suffixed `.gz`/`.br`; the response also carries `Vary: Accept-Encoding`. Range and conditional (`If-None-Match`/`If-Range`) requests apply to whichever representation — raw or variant — was negotiated.

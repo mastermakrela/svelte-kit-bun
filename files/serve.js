@@ -629,7 +629,8 @@ export function decode_pathname(pathname) {
  * Content type for a served asset, taken from SvelteKit's manifest metadata so that
  * types SvelteKit knows about (e.g. `.ico`, `image/jxl`) are used rather than only
  * Bun's own extension mapping. Returns `undefined` when the manifest has no entry,
- * in which case `Bun.file(...).type` is used as the fallback.
+ * in which case `Bun.file(...).type` is used as the fallback. Text and JSON types are
+ * declared UTF-8, as upstream adapter-bun's `Bun.file(...).type` does for the common ones.
  *
  * @param {string} url_path
  * @param {Record<string, string>} mime_types  `builder.mimeTypes`
@@ -643,7 +644,7 @@ export function mime_type(url_path, mime_types) {
 	const type = mime_types[filename.slice(dot)];
 	if (!type) return undefined;
 
-	return type === 'text/html' ? 'text/html;charset=utf-8' : type;
+	return /^text\/|^application\/(.+\+)?json$/.test(type) ? `${type};charset=utf-8` : type;
 }
 
 /**

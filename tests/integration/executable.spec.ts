@@ -233,7 +233,9 @@ describe('response semantics', () => {
 		] as const) {
 			const res = await fetch(`${base_url}${path}`);
 			await res.arrayBuffer();
-			expect(res.headers.get('content-type'), path).toBe(mime_types[ext]);
+			expect(res.headers.get('content-type')?.replace(';charset=utf-8', ''), path).toBe(
+				mime_types[ext]
+			);
 		}
 	});
 
