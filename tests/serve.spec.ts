@@ -165,6 +165,11 @@ describe('read_config', () => {
 		);
 	});
 
+	test('an empty value is the same as unset', () => {
+		const empty = Object.fromEntries([...SUPPORTED_ENV_VARS].map((name) => [`MY_APP_${name}`, '']));
+		expect(read_config(empty, 'MY_APP_', noop)).toEqual(read_config({}, 'MY_APP_', noop));
+	});
+
 	test('SOCKET_PATH defaults to empty (no socket configured)', () => {
 		expect(read_config({}, '', noop).socket_path).toBe('');
 	});

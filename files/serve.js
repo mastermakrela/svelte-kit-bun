@@ -107,10 +107,13 @@ export function read_config(
 	validate_env(env, env_prefix, warn);
 
 	/**
+	 * An empty value counts as unset: `PORT=` would otherwise parse as `0` and bind a
+	 * random port.
+	 *
 	 * @param {keyof typeof ENV_DEFAULTS} name
 	 * @returns {string}
 	 */
-	const read_env = (name) => env[`${env_prefix}${name}`] ?? ENV_DEFAULTS[name];
+	const read_env = (name) => env[`${env_prefix}${name}`] || ENV_DEFAULTS[name];
 
 	const port = Number(read_env('PORT'));
 	if (!Number.isInteger(port) || port < 0 || port > 65535) {

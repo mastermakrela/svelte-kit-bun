@@ -69,7 +69,7 @@ adapter({ precompress: false });
 
 ### Environment variables
 
-The built app reads exactly these variables at startup — nothing else:
+The built app reads exactly these variables at startup — nothing else. An empty value (`PORT=`) is the same as leaving the variable unset:
 
 | Variable                  | Default   | Description                                                                                                                                            |
 | ------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
