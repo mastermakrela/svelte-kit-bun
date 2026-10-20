@@ -407,15 +407,49 @@ describe('resolve_origin', () => {
 		).toBe('https://localhost:3000');
 	});
 
-	test('throws when protocol_header value contains a colon (host-injection guard)', () => {
-		const req = make_request({ 'x-forwarded-proto': 'https://evil.com' });
+	test.each(['https://evil.com', 'ftp', 'javascript'])(
+		'throws when protocol_header is %s rather than http or https',
+		(value) => {
+			const req = make_request({ 'x-forwarded-proto': value });
+			const url = new URL(req.url);
+			expect(() =>
+				resolve_origin(req, url, {
+					...base_cfg,
+					protocol_header: 'x-forwarded-proto'
+				})
+			).toThrow(/invalid protocol scheme/);
+		}
+	);
+
+	test('accepts http in any case and canonicalizes the origin', () => {
+		const req = make_request({ 'x-forwarded-proto': 'HTTP', 'x-forwarded-host': 'Example.COM:80' });
 		const url = new URL(req.url);
-		expect(() =>
+		expect(
 			resolve_origin(req, url, {
 				...base_cfg,
-				protocol_header: 'x-forwarded-proto'
+				protocol_header: 'x-forwarded-proto',
+				host_header: 'x-forwarded-host'
 			})
-		).toThrow(/invalid because it includes/);
+		).toBe('http://example.com');
+	});
+
+	test.each(['example.com/read?', 'example.com?x', 'example.com#x', 'user@example.com', 'a\\b'])(
+		'throws when host_header is %s rather than a bare host[:port]',
+		(value) => {
+			const req = make_request({ 'x-forwarded-host': value });
+			const url = new URL(req.url);
+			expect(() =>
+				resolve_origin(req, url, { ...base_cfg, host_header: 'x-forwarded-host' })
+			).toThrow(/invalid host/);
+		}
+	);
+
+	test('throws when the resulting origin cannot be parsed', () => {
+		const req = make_request({ 'x-forwarded-port': '99999' });
+		const url = new URL(req.url);
+		expect(() =>
+			resolve_origin(req, url, { ...base_cfg, port_header: 'x-forwarded-port' })
+		).toThrow();
 	});
 
 	test('throws when port_header value is not a number', () => {
@@ -1581,7 +1615,7 @@ describe('start', () => {
 			expect(runtime.responded).toHaveLength(0);
 			expect(calls.map((call) => call[0])).toContainEqual(
 				expect.stringMatching(
-					/Could not determine request origin: .*includes `:`.*It should only contain the protocol scheme/
+					/Could not determine request origin: .*invalid protocol scheme.*It should only contain the protocol scheme/
 				)
 			);
 		});
@@ -1612,6 +1646,40 @@ describe('start', () => {
 			expect(runtime.responded).toHaveLength(0);
 			expect(calls.map((call) => call[0])).toContainEqual(
 				expect.stringMatching(/Could not determine request origin: Multiple values provided/)
+			);
+		});
+
+		test.each([
+			['x-forwarded-host', 'example.com/read?'],
+			['x-forwarded-proto', 'ftp'],
+			['x-forwarded-port', '99999']
+		])('an invalid %s (%s) is a 400, not served or a 500', async (header, value) => {
+			vi.stubEnv('HOST_HEADER', 'x-forwarded-host');
+			vi.stubEnv('PROTOCOL_HEADER', 'x-forwarded-proto');
+			vi.stubEnv('PORT_HEADER', 'x-forwarded-port');
+			runtime = await start_runtime();
+
+			// see above for why `process.stderr.write` is reassigned instead of spied on
+			const original_write = process.stderr.write;
+			const calls: unknown[] = [];
+			process.stderr.write = ((message: unknown) => {
+				calls.push(message);
+				return true;
+			}) as typeof process.stderr.write;
+			let res: Response;
+			try {
+				res = await runtime.serve.fetch(
+					new Request('http://localhost/nothing-here', { headers: { [header]: value } }),
+					runtime.srv
+				);
+			} finally {
+				process.stderr.write = original_write;
+			}
+
+			expect(res.status).toBe(400);
+			expect(runtime.responded).toHaveLength(0);
+			expect(calls).toContainEqual(
+				expect.stringMatching(/^adapter-bun: Could not determine request origin: /)
 			);
 		});
 

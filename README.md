@@ -123,7 +123,7 @@ sveltekit({
 
 There is no `ORIGIN` environment variable (SvelteKit 3 removed it from the adapter contract). When `paths.origin` is not set, the origin is always derived from the incoming request, corrected by the `PROTOCOL_HEADER`, `HOST_HEADER`, and `PORT_HEADER` environment variables when running behind a reverse proxy. An unconfigured `PROTOCOL_HEADER` (or one absent from a given request) defaults the derived protocol to `https`, since an app without that header configured is assumed to sit behind a TLS-terminating proxy rather than to be served over plain `http`.
 
-A malformed or ambiguous proxy header — a `PROTOCOL_HEADER` value containing `:`, a non-numeric `PORT_HEADER` value, or a comma-joined value for any of `PROTOCOL_HEADER`/`HOST_HEADER`/`PORT_HEADER` (each expects exactly one value; Bun already joins a repeated header with `, `) — fails the request with `400 Bad Request` and logs `Could not determine request origin: …` to stderr, rather than falling through to a generic `500`.
+A malformed or ambiguous proxy header — a `PROTOCOL_HEADER` value other than `http` or `https`, a `HOST_HEADER` value that is more than a bare `host[:port]` (a `/`, `?`, `#`, `@` or `\`), a non-numeric `PORT_HEADER` value, a combination that doesn't parse as an origin (e.g. a port above 65535), or a comma-joined value for any of `PROTOCOL_HEADER`/`HOST_HEADER`/`PORT_HEADER` (each expects exactly one value; Bun already joins a repeated header with `, `) — fails the request with `400 Bad Request` and logs `Could not determine request origin: …` to stderr, rather than falling through to a generic `500`.
 
 ### Server instrumentation
 

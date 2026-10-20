@@ -424,7 +424,7 @@ export async function start({
 			}
 
 			const final_request =
-				`${url.protocol}//${url.host}` === effective_origin
+				url.origin === effective_origin
 					? request
 					: new Request(`${effective_origin}${url.pathname}${url.search}`, request);
 
@@ -567,10 +567,9 @@ export function resolve_origin(
 		? normalise_header(protocol_header, headers.get(protocol_header))
 		: undefined;
 	const protocol = decodeURIComponent(raw_protocol || 'https');
-	// prevent host-injection through the protocol header (RFC 7230 §5.5)
-	if (protocol.includes(':')) {
+	if (!/^https?$/i.test(protocol)) {
 		throw new Error(
-			`The ${protocol_header} header specified '${protocol}' which is invalid because it includes \`:\`. It should only contain the protocol scheme (e.g. \`https\`)`
+			`The ${protocol_header} header specified '${protocol}' which is an invalid protocol scheme. It should only contain the protocol scheme (e.g. \`https\`)`
 		);
 	}
 
@@ -583,6 +582,13 @@ export function resolve_origin(
 		const header_names = host_header ? `${host_header} or host` : 'host';
 		throw new Error(
 			`Could not determine host. The request must have a value provided by the ${header_names} header`
+		);
+	}
+	// a path, query, fragment or userinfo would otherwise end up in the request URL
+	// SvelteKit routes on (`example.com/read?` + `/nothing-here` serving `/read`)
+	if (/[/?#@\\]/.test(host)) {
+		throw new Error(
+			`The ${host_header} header specified '${host}' which is an invalid host. It should only contain the host and an optional port (e.g. \`example.com:8443\`)`
 		);
 	}
 
@@ -599,7 +605,9 @@ export function resolve_origin(
 		}
 	}
 
-	return port ? `${protocol}://${host}:${port}` : `${protocol}://${host}`;
+	// parsed here, inside the caller's 400 handling, so e.g. a port above 65535 is a bad
+	// request; `.origin` also canonicalizes case and default ports for the caller's comparison
+	return new URL(port ? `${protocol}://${host}:${port}` : `${protocol}://${host}`).origin;
 }
 
 /**
