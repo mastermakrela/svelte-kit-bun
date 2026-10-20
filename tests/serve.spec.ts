@@ -1628,6 +1628,21 @@ describe('start', () => {
 			expect(runtime.timeouts).toEqual([{ request, seconds: 0 }]);
 		});
 
+		test('SSE detection ignores media type parameters such as charset', async () => {
+			vi.stubEnv('CONNECTION_IDLE_TIMEOUT', '30');
+			runtime = await start_runtime({
+				respond: async () =>
+					new Response('data: hi\n\n', {
+						headers: { 'content-type': 'text/event-stream; charset=utf-8' }
+					})
+			});
+
+			const request = new Request('http://localhost/sse');
+			const res = await runtime.serve.fetch(request, runtime.srv);
+			expect(res.headers.get('x-accel-buffering')).toBe('no');
+			expect(runtime.timeouts).toEqual([{ request, seconds: 0 }]);
+		});
+
 		test('no per-request timeout override is needed with the default (no) timeout', async () => {
 			runtime = await start_runtime({
 				respond: async () =>

@@ -156,7 +156,7 @@ Embedded assets are served with the same semantics as `@sveltejs/adapter-node`:
 - Dotfiles under `static/` (any path segment starting with `.`) are not embedded in the executable or served, except under `.well-known/`.
 - A `.html` file in `static/` gets clean-URL aliases: `/foo` and `/foo/` resolve to `foo.html`, or to `foo/index.html` when only that exists. An exact file always wins over an alias, and when both `foo.html` and `foo/index.html` exist, `foo.html` claims the aliases.
 - Every path SvelteKit prerendered — pages, non-HTML assets, and redirects (served as the stub page SvelteKit writes for them) — is matched only at that exact path. Its other trailing-slash form gets a `308` with a **relative** `location` (`../about`, or `./about/` the other way round), so it keeps working behind a proxy that strips a mount prefix; the query string is preserved, and a non-`GET`/`HEAD` request gets `405` like any other static path.
-- Responses whose `content-type` is exactly `text/event-stream` get `x-accel-buffering: no`, which stops nginx-style proxies from buffering server-sent events.
+- Responses whose `content-type` is `text/event-stream` (with or without parameters such as `charset=utf-8`) get `x-accel-buffering: no`, which stops nginx-style proxies from buffering server-sent events.
 
 ### Windows executable icon and metadata
 

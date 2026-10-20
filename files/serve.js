@@ -438,7 +438,7 @@ export async function start({
 			// `cache-control`), which breaks streaming responses like server-sent events.
 			// `X-Accel-Buffering: no` opts out of that buffering and is a no-op on proxies
 			// that don't recognise it. See https://github.com/sveltejs/kit/issues/15790
-			if (response.headers.get('content-type') === 'text/event-stream') {
+			if (response.headers.get('content-type')?.startsWith('text/event-stream')) {
 				response.headers.set('x-accel-buffering', 'no');
 
 				// A server-sent-events stream may stay quiet for longer than
