@@ -607,6 +607,9 @@ describe('make_asset_handler', () => {
 	const FILE_SIZE = 1000;
 	const ETAG = 'abc123';
 	const QUOTED_ETAG = `"${ETAG}"`;
+	// sub-second part on purpose: HTTP dates only carry whole seconds
+	const MTIME = Date.UTC(2026, 9, 20, 12, 0, 0, 500);
+	const LAST_MODIFIED = 'Tue, 20 Oct 2026 12:00:00 GMT';
 
 	beforeEach(() => {
 		vi.stubGlobal('Bun', {
@@ -624,7 +627,7 @@ describe('make_asset_handler', () => {
 
 	/** Build a full `Asset` for `make_asset_handler`, overriding only what a test cares about. */
 	function asset(overrides: Partial<Parameters<typeof make_asset_handler>[0]> = {}) {
-		return { file: '/bunfs/favicon.png', size: FILE_SIZE, etag: ETAG, ...overrides };
+		return { file: '/bunfs/favicon.png', size: FILE_SIZE, etag: ETAG, mtime: MTIME, ...overrides };
 	}
 
 	test('GET returns 200 with body, etag, and headers', async () => {
@@ -635,6 +638,7 @@ describe('make_asset_handler', () => {
 		expect(res.headers.get('content-length')).toBe(String(FILE_SIZE));
 		expect(res.headers.get('accept-ranges')).toBe('bytes');
 		expect(res.headers.get('etag')).toBe(QUOTED_ETAG);
+		expect(res.headers.get('last-modified')).toBe(LAST_MODIFIED);
 		expect(res.body).not.toBeNull();
 	});
 
@@ -796,7 +800,7 @@ describe('make_asset_handler', () => {
 	});
 
 	describe('conditional requests (If-None-Match)', () => {
-		test('an exact matching etag returns 304 with etag + cache-control only', () => {
+		test('an exact matching etag returns 304 with validators + cache-control only', () => {
 			const handler = make_asset_handler(
 				asset({ cache_control: 'public,max-age=31536000,immutable' })
 			);
@@ -807,6 +811,7 @@ describe('make_asset_handler', () => {
 			);
 			expect(res.status).toBe(304);
 			expect(res.headers.get('etag')).toBe(QUOTED_ETAG);
+			expect(res.headers.get('last-modified')).toBe(LAST_MODIFIED);
 			expect(res.headers.get('cache-control')).toBe('public,max-age=31536000,immutable');
 			expect(res.headers.get('content-length')).toBeNull();
 			expect(res.headers.get('content-type')).toBeNull();
@@ -859,6 +864,31 @@ describe('make_asset_handler', () => {
 			);
 			expect(res.status).toBe(304);
 			expect(res.body).toBeNull();
+		});
+	});
+
+	describe('conditional requests (If-Modified-Since)', () => {
+		const get = (headers: Record<string, string>) =>
+			make_asset_handler(asset())(new Request('http://localhost/favicon.png', { headers }));
+
+		test('a date at or after Last-Modified returns 304', () => {
+			expect(get({ 'if-modified-since': LAST_MODIFIED }).status).toBe(304);
+			expect(get({ 'if-modified-since': 'Wed, 21 Oct 2026 00:00:00 GMT' }).status).toBe(304);
+		});
+
+		test('an earlier or unparseable date returns the full 200', () => {
+			expect(get({ 'if-modified-since': 'Tue, 20 Oct 2026 11:59:59 GMT' }).status).toBe(200);
+			expect(get({ 'if-modified-since': 'yesterday' }).status).toBe(200);
+		});
+
+		test('If-None-Match takes precedence over If-Modified-Since (RFC 9110 §13.1.3)', () => {
+			expect(get({ 'if-none-match': '"stale"', 'if-modified-since': LAST_MODIFIED }).status).toBe(
+				200
+			);
+			expect(
+				get({ 'if-none-match': QUOTED_ETAG, 'if-modified-since': 'Thu, 01 Jan 1970 00:00:00 GMT' })
+					.status
+			).toBe(304);
 		});
 	});
 
@@ -1092,7 +1122,7 @@ describe('etag_matches', () => {
 
 /** `size` is derived from the bunfs path so a response identifies which file its handler was built from. */
 function built_asset(file: string) {
-	return { file, size: file.length, etag: file };
+	return { file, size: file.length, etag: file, mtime: 0 };
 }
 
 describe('create_file_map', () => {

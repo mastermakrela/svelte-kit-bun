@@ -10,6 +10,7 @@
  * @property {string} key - For client/prerendered this is the URL path served; for server assets it's the manifest._.server_assets key
  * @property {string} [etag] - sha256/base64url content hash, computed at build time (client/prerendered only)
  * @property {number} [size] - file size in bytes, computed at build time (client/prerendered only)
+ * @property {number} [mtime] - modification time in ms, recorded at build time (client/prerendered only)
  * @property {CompressedVariant} [br] - precompressed brotli variant, when `precompress` produced one
  * @property {CompressedVariant} [gz] - precompressed gzip variant, when `precompress` produced one
  */
@@ -17,8 +18,8 @@
 /**
  * @param {AssetEntry[]} entries
  * @param {string} prefix - identifier prefix (e.g. `_client`)
- * @param {boolean} with_metadata - emit `{ file, etag, size }` instead of a bare identifier
- *   (client/prerendered assets carry build-time etag/size for `create_file_map`; server assets don't need it)
+ * @param {boolean} with_metadata - emit `{ file, size, etag, mtime }` instead of a bare identifier
+ *   (client/prerendered assets carry build-time metadata for `create_file_map`; server assets don't need it)
  * @returns {{ imports: string[], map: string }}
  */
 function render_asset_group(entries, prefix, with_metadata) {
@@ -29,7 +30,7 @@ function render_asset_group(entries, prefix, with_metadata) {
 
 	for (let i = 0; i < entries.length; i++) {
 		const id = `${prefix}_${i}`;
-		const { import_path, key, etag, size, br, gz } = entries[i];
+		const { import_path, key, etag, size, mtime, br, gz } = entries[i];
 		imports.push(`import ${id} from ${JSON.stringify(import_path)} with { type: 'file' };`);
 
 		let value = id;
@@ -37,7 +38,8 @@ function render_asset_group(entries, prefix, with_metadata) {
 			const fields = [
 				`file: ${id}`,
 				`size: ${JSON.stringify(size)}`,
-				`etag: ${JSON.stringify(etag)}`
+				`etag: ${JSON.stringify(etag)}`,
+				`mtime: ${JSON.stringify(mtime)}`
 			];
 
 			for (const [variant_name, variant] of /** @type {const} */ ([

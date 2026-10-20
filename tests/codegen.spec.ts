@@ -16,17 +16,25 @@ describe('generate_entry', () => {
 					import_path: './client/favicon.png',
 					key: '/favicon.png',
 					size: 1234,
-					etag: 'etag-favicon'
+					etag: 'etag-favicon',
+					mtime: 0
 				},
 				{
 					import_path: './client/_app/immutable/chunks/abc.js',
 					key: '/_app/immutable/chunks/abc.js',
 					size: 42,
-					etag: 'etag-abc'
+					etag: 'etag-abc',
+					mtime: 0
 				}
 			],
 			prerendered_assets: [
-				{ import_path: './prerendered/about.html', key: '/about', size: 99, etag: 'etag-about' }
+				{
+					import_path: './prerendered/about.html',
+					key: '/about',
+					size: 99,
+					etag: 'etag-about',
+					mtime: 0
+				}
 			],
 			server_assets: [{ import_path: './server/_app/immutable/assets/data.bin', key: 'data.bin' }]
 		});
@@ -34,21 +42,29 @@ describe('generate_entry', () => {
 		expect(output).toMatchSnapshot();
 	});
 
-	test('client/prerendered map entries carry build-time size/etag; server assets stay plain identifiers', () => {
+	test('client/prerendered map entries carry build-time size/etag/mtime; server assets stay plain identifiers', () => {
 		const output = generate_entry({
 			...defaults,
-			client_assets: [{ import_path: './client/a.png', key: '/a.png', size: 10, etag: 'etag-a' }],
+			client_assets: [
+				{ import_path: './client/a.png', key: '/a.png', size: 10, etag: 'etag-a', mtime: 0 }
+			],
 			prerendered_assets: [
-				{ import_path: './prerendered/about.html', key: '/about', size: 20, etag: 'etag-about' }
+				{
+					import_path: './prerendered/about.html',
+					key: '/about',
+					size: 20,
+					etag: 'etag-about',
+					mtime: 0
+				}
 			],
 			server_assets: [{ import_path: './server/x.bin', key: 'x.bin' }]
 		});
 
 		expect(output).toContain(
-			'const client_assets = {\n\t"/a.png": { file: _client_0, size: 10, etag: "etag-a" }\n};'
+			'const client_assets = {\n\t"/a.png": { file: _client_0, size: 10, etag: "etag-a", mtime: 0 }\n};'
 		);
 		expect(output).toContain(
-			'const prerendered_assets = {\n\t"/about": { file: _prerendered_0, size: 20, etag: "etag-about" }\n};'
+			'const prerendered_assets = {\n\t"/about": { file: _prerendered_0, size: 20, etag: "etag-about", mtime: 0 }\n};'
 		);
 		expect(output).toContain('const server_assets = {\n\t"x.bin": _server_0\n};');
 	});
@@ -84,14 +100,16 @@ describe('generate_entry', () => {
 	test('only one category populated: client only', () => {
 		const output = generate_entry({
 			...defaults,
-			client_assets: [{ import_path: './client/a.js', key: '/a.js', size: 10, etag: 'etag-a' }],
+			client_assets: [
+				{ import_path: './client/a.js', key: '/a.js', size: 10, etag: 'etag-a', mtime: 0 }
+			],
 			prerendered_assets: [],
 			server_assets: []
 		});
 
 		expect(output).toContain('import _client_0 from "./client/a.js" with { type: \'file\' };');
 		expect(output).toContain(
-			'const client_assets = {\n\t"/a.js": { file: _client_0, size: 10, etag: "etag-a" }\n};'
+			'const client_assets = {\n\t"/a.js": { file: _client_0, size: 10, etag: "etag-a", mtime: 0 }\n};'
 		);
 		expect(output).toContain('const prerendered_assets = {};');
 		expect(output).toContain('const server_assets = {};');
@@ -162,20 +180,23 @@ describe('generate_entry', () => {
 					import_path: './client/with space.png',
 					key: '/with space.png',
 					size: 1,
-					etag: 'e1'
+					etag: 'e1',
+					mtime: 0
 				},
-				{ import_path: './client/quote".js', key: '/quote".js', size: 2, etag: 'e2' },
+				{ import_path: './client/quote".js', key: '/quote".js', size: 2, etag: 'e2', mtime: 0 },
 				{
 					import_path: './client/emoji-\u{1F525}.txt',
 					key: '/emoji-\u{1F525}.txt',
 					size: 3,
-					etag: 'e3'
+					etag: 'e3',
+					mtime: 0
 				},
 				{
 					import_path: './client/slash/nested/file.js',
 					key: '/slash/nested/file.js',
 					size: 4,
-					etag: 'e4'
+					etag: 'e4',
+					mtime: 0
 				}
 			],
 			prerendered_assets: [],
@@ -200,11 +221,11 @@ describe('generate_entry', () => {
 		const input = {
 			...defaults,
 			client_assets: [
-				{ import_path: './client/a.png', key: '/a.png', size: 1, etag: 'ea' },
-				{ import_path: './client/b.png', key: '/b.png', size: 2, etag: 'eb' }
+				{ import_path: './client/a.png', key: '/a.png', size: 1, etag: 'ea', mtime: 0 },
+				{ import_path: './client/b.png', key: '/b.png', size: 2, etag: 'eb', mtime: 0 }
 			],
 			prerendered_assets: [
-				{ import_path: './prerendered/index.html', key: '/', size: 3, etag: 'ei' }
+				{ import_path: './prerendered/index.html', key: '/', size: 3, etag: 'ei', mtime: 0 }
 			],
 			server_assets: [{ import_path: './server/x.bin', key: 'x.bin' }]
 		};
@@ -219,13 +240,13 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/0.js', key: '/0.js', size: 1, etag: 'e0' },
-				{ import_path: './client/1.js', key: '/1.js', size: 1, etag: 'e1' },
-				{ import_path: './client/2.js', key: '/2.js', size: 1, etag: 'e2' }
+				{ import_path: './client/0.js', key: '/0.js', size: 1, etag: 'e0', mtime: 0 },
+				{ import_path: './client/1.js', key: '/1.js', size: 1, etag: 'e1', mtime: 0 },
+				{ import_path: './client/2.js', key: '/2.js', size: 1, etag: 'e2', mtime: 0 }
 			],
 			prerendered_assets: [
-				{ import_path: './prerendered/a.html', key: '/a', size: 1, etag: 'ea' },
-				{ import_path: './prerendered/b.html', key: '/b', size: 1, etag: 'eb' }
+				{ import_path: './prerendered/a.html', key: '/a', size: 1, etag: 'ea', mtime: 0 },
+				{ import_path: './prerendered/b.html', key: '/b', size: 1, etag: 'eb', mtime: 0 }
 			],
 			server_assets: [{ import_path: './server/s.bin', key: 's.bin' }]
 		});
@@ -247,9 +268,9 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/z.js', key: '/z.js', size: 1, etag: 'ez' },
-				{ import_path: './client/a.js', key: '/a.js', size: 1, etag: 'ea' },
-				{ import_path: './client/m.js', key: '/m.js', size: 1, etag: 'em' }
+				{ import_path: './client/z.js', key: '/z.js', size: 1, etag: 'ez', mtime: 0 },
+				{ import_path: './client/a.js', key: '/a.js', size: 1, etag: 'ea', mtime: 0 },
+				{ import_path: './client/m.js', key: '/m.js', size: 1, etag: 'em', mtime: 0 }
 			],
 			prerendered_assets: [],
 			server_assets: []
@@ -267,8 +288,12 @@ describe('generate_entry', () => {
 	test('imports are ordered: fixed first, then client, prerendered, server', () => {
 		const output = generate_entry({
 			...defaults,
-			client_assets: [{ import_path: './client/c.js', key: '/c.js', size: 1, etag: 'ec' }],
-			prerendered_assets: [{ import_path: './prerendered/p.html', key: '/p', size: 1, etag: 'ep' }],
+			client_assets: [
+				{ import_path: './client/c.js', key: '/c.js', size: 1, etag: 'ec', mtime: 0 }
+			],
+			prerendered_assets: [
+				{ import_path: './prerendered/p.html', key: '/p', size: 1, etag: 'ep', mtime: 0 }
+			],
 			server_assets: [{ import_path: './server/s.bin', key: 's.bin' }]
 		});
 
@@ -296,6 +321,7 @@ describe('generate_entry', () => {
 					key: '/app.js',
 					size: 100,
 					etag: 'etag-app',
+					mtime: 0,
 					br: { import_path: './client/app.js.br', size: 40 },
 					gz: { import_path: './client/app.js.gz', size: 60 }
 				}
@@ -306,6 +332,7 @@ describe('generate_entry', () => {
 					key: '/about',
 					size: 200,
 					etag: 'etag-about',
+					mtime: 0,
 					br: { import_path: './prerendered/about.html.br', size: 80 },
 					gz: { import_path: './prerendered/about.html.gz', size: 120 }
 				}
@@ -320,7 +347,7 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/app.js', key: '/app.js', size: 100, etag: 'etag-app' }
+				{ import_path: './client/app.js', key: '/app.js', size: 100, etag: 'etag-app', mtime: 0 }
 			],
 			prerendered_assets: [],
 			server_assets: []
@@ -331,7 +358,7 @@ describe('generate_entry', () => {
 		expect(output).not.toContain('.br"');
 		expect(output).not.toContain('.gz"');
 		expect(output).toContain(
-			'const client_assets = {\n\t"/app.js": { file: _client_0, size: 100, etag: "etag-app" }\n};'
+			'const client_assets = {\n\t"/app.js": { file: _client_0, size: 100, etag: "etag-app", mtime: 0 }\n};'
 		);
 	});
 
@@ -339,12 +366,13 @@ describe('generate_entry', () => {
 		const output = generate_entry({
 			...defaults,
 			client_assets: [
-				{ import_path: './client/a.js', key: '/a.js', size: 1, etag: 'ea' },
+				{ import_path: './client/a.js', key: '/a.js', size: 1, etag: 'ea', mtime: 0 },
 				{
 					import_path: './client/b.png',
 					key: '/b.png',
 					size: 2,
 					etag: 'eb',
+					mtime: 0,
 					gz: { import_path: './client/b.png.gz', size: 1 }
 				}
 			],
@@ -359,7 +387,7 @@ describe('generate_entry', () => {
 		);
 		expect(output).not.toContain('_client_1_br');
 		expect(output).toContain(
-			'"/b.png": { file: _client_1, size: 2, etag: "eb", gz: { file: _client_1_gz, size: 1 } }'
+			'"/b.png": { file: _client_1, size: 2, etag: "eb", mtime: 0, gz: { file: _client_1_gz, size: 1 } }'
 		);
 	});
 

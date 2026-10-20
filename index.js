@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readSync, rmSync, statSync } from 'node:fs';
+import { closeSync, fstatSync, mkdirSync, openSync, readSync, rmSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { generate_entry } from './src/codegen.js';
@@ -32,17 +32,20 @@ function is_hidden(file) {
 /**
  * Size and content hash (sha256, base64url) from one pass over the file, a buffer
  * at a time, mirroring upstream adapter-node's `measure` — so large embedded
- * assets are neither read fully into memory nor hashed twice.
+ * assets are neither read fully into memory nor hashed twice — plus the mtime,
+ * which embedded `$bunfs` files no longer have at runtime.
  * @param {string} path
  * @param {Buffer} buffer
- * @returns {{ size: number, etag: string }}
+ * @returns {{ size: number, etag: string, mtime: number }}
  */
 function measure(path, buffer) {
 	const fd = openSync(path, 'r');
 	const hash = createHash('sha256');
 	let size = 0;
+	let mtime;
 
 	try {
+		mtime = fstatSync(fd).mtimeMs;
 		let read;
 		while ((read = readSync(fd, buffer)) > 0) {
 			hash.update(buffer.subarray(0, read));
@@ -52,7 +55,7 @@ function measure(path, buffer) {
 		closeSync(fd);
 	}
 
-	return { size, etag: hash.digest('base64url') };
+	return { size, etag: hash.digest('base64url'), mtime };
 }
 
 /**

@@ -181,6 +181,7 @@ const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
  * @property {string} file  $bunfs path
  * @property {number} size
  * @property {string} etag  bare sha256/base64url content hash, computed at build time
+ * @property {number} mtime  modification time in ms, recorded at build time (`$bunfs` has none)
  * @property {CompressedVariant} [br]
  * @property {CompressedVariant} [gz]
  */
@@ -190,6 +191,7 @@ const IMMUTABLE_CACHE_CONTROL = 'public,max-age=31536000,immutable';
  * @property {string} file
  * @property {number} size
  * @property {string} etag
+ * @property {number} mtime
  * @property {string} [type]
  * @property {string} [cache_control]
  * @property {CompressedVariant} [br]
@@ -746,7 +748,9 @@ export function make_redirect_handler(location) {
 
 /**
  * Handler for one static asset: GET/HEAD only (every other method, including
- * OPTIONS, gets 405), conditional requests via `ETag`/`If-None-Match`, and
+ * OPTIONS, gets 405), conditional requests via `ETag`/`If-None-Match` and
+ * `Last-Modified`/`If-Modified-Since` (If-None-Match wins when both are sent, per
+ * RFC 9110 §13.1.3, mirroring upstream adapter-bun's `is_fresh`), and
  * `Range` requests exactly like upstream adapter-node's `serve_static` — `end`
  * beyond `size - 1` is clamped rather than rejected, `bytes=-N` is a suffix
  * range, an unbounded `bytes=` (neither bound given) is ignored and falls
@@ -766,10 +770,14 @@ export function make_asset_handler({
 	type,
 	cache_control,
 	etag: hash,
+	mtime,
 	br,
 	gz
 }) {
 	const file = Bun.file(bunfs_path);
+	const last_modified = new Date(mtime).toUTCString();
+	// HTTP dates have whole-second precision
+	const mtime_s = Math.trunc(mtime / 1000);
 	const content_type = type ?? file.type;
 	const etag = `"${hash}"`;
 	const has_variants = Boolean(br || gz);
@@ -807,11 +815,16 @@ export function make_asset_handler({
 		}
 
 		/** @type {Record<string, string>} */
-		const base_headers = { etag: serve_etag };
+		const base_headers = { etag: serve_etag, 'last-modified': last_modified };
 		if (has_variants) base_headers.vary = 'Accept-Encoding';
 		if (cache_control) base_headers['cache-control'] = cache_control;
 
-		if (etag_matches(request.headers.get('if-none-match'), serve_etag)) {
+		const if_none_match = request.headers.get('if-none-match');
+		const fresh =
+			if_none_match === null
+				? mtime_s <= Math.trunc(Date.parse(request.headers.get('if-modified-since') ?? '') / 1000)
+				: etag_matches(if_none_match, serve_etag);
+		if (fresh) {
 			return new Response(null, { status: 304, headers: base_headers });
 		}
 

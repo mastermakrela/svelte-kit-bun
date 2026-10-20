@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import http from 'node:http';
 import { brotliDecompressSync, gunzipSync } from 'node:zlib';
@@ -361,6 +361,21 @@ describe('static asset semantics', () => {
 		expect(res.headers.get('content-type')).toBeNull();
 		const body = await res.arrayBuffer();
 		expect(body.byteLength).toBe(0);
+	});
+
+	test('Last-Modified is the build-time mtime and If-Modified-Since honours it', async () => {
+		const first = await fetch(`${base_url}/favicon.png`);
+		await first.arrayBuffer();
+		const last_modified = first.headers.get('last-modified')!;
+		expect(last_modified).toBe(
+			new Date(statSync(join(fixture, 'build/client/favicon.png')).mtimeMs).toUTCString()
+		);
+
+		const res = await fetch(`${base_url}/favicon.png`, {
+			headers: { 'if-modified-since': last_modified }
+		});
+		expect(res.status).toBe(304);
+		expect(res.headers.get('last-modified')).toBe(last_modified);
 	});
 
 	test('a non-matching If-None-Match returns the full 200', async () => {
