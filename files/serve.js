@@ -308,14 +308,22 @@ export function create_file_map({ app_path, mime_types, client_assets, prerender
 		if (without_slash && !files.has(without_slash)) files.set(without_slash, asset);
 	}
 
-	for (const [key, raw] of Object.entries(prerendered_assets)) {
+	// Kit records prerendered paths as `decodeURI(pathname)`, which leaves escapes of
+	// reserved characters (`%23`, `%2B`, `%40`, …) encoded; decode those, except `%2F`,
+	// so the keys line up with `decode_pathname`'s output
+	/** @param {string} path */
+	const prerendered_key = (path) => path.replace(/%(2[346BC]|3[ABDF]|40)/gi, decodeURIComponent);
+
+	for (const [path, raw] of Object.entries(prerendered_assets)) {
+		const key = prerendered_key(path);
 		if (!files.has(key)) files.set(key, to_asset(key, raw));
 	}
 
-	for (const key of Object.keys(prerendered_assets)) {
-		const inverted = key.at(-1) === '/' ? key.slice(0, -1) : key + '/';
-		if (inverted && !files.has(inverted)) {
-			files.set(inverted, { location: relative_pathname(inverted, key) });
+	for (const path of Object.keys(prerendered_assets)) {
+		const inverted = path.at(-1) === '/' ? path.slice(0, -1) : path + '/';
+		const key = prerendered_key(inverted);
+		if (inverted && !files.has(key)) {
+			files.set(key, { location: relative_pathname(inverted, path) });
 		}
 	}
 
@@ -613,15 +621,14 @@ export function resolve_origin(
 }
 
 /**
- * Decode a request pathname the way SvelteKit's router does: split on the literal `%25`
- * (a percent-encoded `%`) and `decodeURI` each piece separately, rather than decoding the
- * whole pathname in one pass. That keeps reserved characters like `%2F` encoded (`decodeURI`
- * already leaves them alone), and — because the split removes every `%25` *before*
- * `decodeURI` runs — a literal `%25` in the path stays `%25` instead of `decodeURI` turning
- * it into a bare `%`, while any other `%XX` escape in the surrounding pieces still decodes
- * normally. Mirrors `decode_pathname` in `@sveltejs/kit/src/utils/url.js` and upstream
- * adapter-node's `static.js#split_url`. A malformed `%` escape is left undecoded, same as
- * upstream.
+ * Decode a request pathname for the static asset lookup, whose keys are raw file paths
+ * (`/100%.txt`, `/a#b.txt`): every `/`-separated segment is `decodeURIComponent`-ed once,
+ * so `%25`, `%23`, `%3F` and `%2B` (in either hex case) match the names they spell.
+ * SvelteKit's router keeps `%25` and reserved escapes encoded because route params get
+ * decoded again later; nothing decodes a static key twice, so that reason doesn't apply
+ * here. Its other reason does: a segment that would decode to contain `/` (`%2F`) is left
+ * encoded, so it can never be mistaken for a nested file. A malformed `%` escape leaves the
+ * pathname undecoded. SSR still receives the original, undecoded pathname.
  *
  * @param {string} pathname
  * @returns {string}
@@ -629,7 +636,13 @@ export function resolve_origin(
 export function decode_pathname(pathname) {
 	if (!pathname.includes('%')) return pathname;
 	try {
-		return pathname.split('%25').map(decodeURI).join('%25');
+		return pathname
+			.split('/')
+			.map((segment) => {
+				const decoded = decodeURIComponent(segment);
+				return decoded.includes('/') ? segment : decoded;
+			})
+			.join('/');
 	} catch {
 		return pathname;
 	}

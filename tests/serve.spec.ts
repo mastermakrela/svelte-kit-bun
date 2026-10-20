@@ -527,10 +527,14 @@ describe('decode_pathname', () => {
 		expect(decode_pathname('/a%2Fb')).toBe('/a%2Fb');
 	});
 
-	test('keeps a literal %25 encoded while still decoding neighbouring escapes', () => {
-		// splitting on the literal '%25' before decoding is what keeps it from being
-		// turned into a bare '%' — plain decodeURIComponent would decode it
-		expect(decode_pathname('/100%25off%20now')).toBe('/100%25off now');
+	test('decodes escapes that spell file-name characters, %25 included', () => {
+		expect(decode_pathname('/100%25off%20now')).toBe('/100%off now');
+		expect(decode_pathname('/a%23b%3Fc%2Bd')).toBe('/a#b?c+d');
+		expect(decode_pathname('/caf%c3%a9')).toBe('/café');
+	});
+
+	test('decodes each segment once, so a double-encoded escape stays single-encoded', () => {
+		expect(decode_pathname('/100%2525.txt')).toBe('/100%25.txt');
 	});
 
 	test('a malformed % escape is left undecoded rather than throwing', () => {
@@ -1375,6 +1379,64 @@ describe('start', () => {
 	});
 
 	describe('static asset table', () => {
+		test('static file names with escaped characters match, but %2F never names a nested file', async () => {
+			runtime = await start_runtime({
+				client_assets: {
+					'/100%.txt': built_asset('/bunfs/100%.txt'),
+					'/a#b.txt': built_asset('/bunfs/a#b.txt'),
+					'/a?b.txt': built_asset('/bunfs/a?b.txt'),
+					'/a+b.txt': built_asset('/bunfs/a+b.txt'),
+					'/café.txt': built_asset('/bunfs/café.txt'),
+					'/dir/x.txt': built_asset('/bunfs/dir/x.txt')
+				}
+			});
+
+			const served = async (path: string) => {
+				const before = runtime!.responded.length;
+				await runtime!.serve.fetch(new Request(`http://localhost${path}`), runtime!.srv);
+				return runtime!.responded.length === before;
+			};
+
+			for (const path of [
+				'/100%25.txt',
+				'/a%23b.txt',
+				'/a%3Fb.txt',
+				'/a%2Bb.txt',
+				'/a%2bb.txt',
+				'/a+b.txt',
+				'/caf%C3%A9.txt',
+				'/caf%c3%a9.txt',
+				'/dir/x.txt'
+			]) {
+				expect(await served(path), path).toBe(true);
+			}
+			expect(await served('/dir%2Fx.txt')).toBe(false);
+		});
+
+		test('prerendered paths with reserved escapes (as Kit records them) still match', async () => {
+			// Kit keys prerendered paths by `decodeURI(pathname)`, which keeps `%2B`, `%23`, … encoded
+			runtime = await start_runtime({
+				prerendered_assets: {
+					'/tags/c%2B%2B': built_asset('/bunfs/c++.html'),
+					'/a%23b': built_asset('/bunfs/a#b.html'),
+					'/x%2Fy': built_asset('/bunfs/x-y.html'),
+					'/100%': built_asset('/bunfs/100.html')
+				}
+			});
+
+			const fetch_path = (path: string) =>
+				runtime!.serve.fetch(new Request(`http://localhost${path}`), runtime!.srv);
+
+			for (const path of ['/tags/c%2B%2B', '/tags/c++', '/a%23b', '/x%2Fy', '/100%25']) {
+				expect((await fetch_path(path)).status, path).toBe(200);
+			}
+			expect(runtime.responded).toHaveLength(0);
+
+			const redirect = await fetch_path('/a%23b/');
+			expect(redirect.status).toBe(308);
+			expect(redirect.headers.get('location')).toBe('../a%23b');
+		});
+
 		test('immutable client assets are cached forever, everything else is not', async () => {
 			runtime = await start_runtime({
 				client_assets: {
